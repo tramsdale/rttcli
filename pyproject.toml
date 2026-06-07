@@ -1,0 +1,8 @@
+[project]
+name = "rttcli"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["requests", "rich"]
+
+[dependency-groups]
+dev = ["pytest", "pytest-mock"]
