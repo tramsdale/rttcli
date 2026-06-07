@@ -361,6 +361,11 @@ class TestFindNextServiceAfter:
     def test_empty_list_returns_none(self):
         assert find_next_service_after([], datetime(2026, 6, 7, 9, 0, 0)) is None
 
+    def test_skips_earlier_services(self):
+        svcs = self._make_services(["08:00", "09:00", "10:00"])
+        result = find_next_service_after(svcs, datetime(2026, 6, 7, 9, 30, 0))
+        assert "10:00" in result["temporalData"]["departure"]["scheduleAdvertised"]
+
 
 # ── display_departures ────────────────────────────────────────────────────────
 

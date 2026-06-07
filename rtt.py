@@ -580,9 +580,19 @@ def display_route(route: dict, route_name: str, time_from: str) -> None:
     leg2_from_name = q2.get("location", {}).get("description", leg2_from)
     leg2_to_name   = q2.get("filterTo", {}).get("description", leg2_to)
 
-    # Match each connection to the next available leg 2 service
+    # Match each connection to the next available leg 2 service, and resolve its arrival
     for conn in connections:
-        conn["leg2_svc"] = find_next_service_after(leg2_services, conn["leg2_earliest"])
+        s2 = find_next_service_after(leg2_services, conn["leg2_earliest"])
+        conn["leg2_svc"] = s2
+        if s2 is None:
+            conn["leg2_arr"] = None
+            continue
+        arr2 = get_terminus_arrival(s2, leg2_to)
+        if arr2 is None:
+            s2_meta = s2.get("scheduleMetadata", {})
+            detail2 = api_service(s2_meta.get("identity", ""), s2_meta.get("departureDate", ""))
+            arr2 = find_arrival_at(detail2, leg2_to)
+        conn["leg2_arr"] = arr2
 
     # ── Header ──
     console.print()
@@ -602,6 +612,7 @@ def display_route(route: dict, route_name: str, time_from: str) -> None:
     tbl.add_column(f"{leg1_to} arr",  width=8, min_width=5, no_wrap=True)
     tbl.add_column(f"{leg2_from} dep", width=9, min_width=5, no_wrap=True)
     tbl.add_column("Code",          width=6,  min_width=4, no_wrap=True)
+    tbl.add_column(f"{leg2_to} arr",  width=8, min_width=5, no_wrap=True)
     tbl.add_column("Status",        width=22, min_width=8)
 
     for i, conn in enumerate(connections, 1):
@@ -616,8 +627,9 @@ def display_route(route: dict, route_name: str, time_from: str) -> None:
         if s2:
             dep2 = (s2.get("temporalData") or {}).get("departure") or {}
             dep2_str, dep2_status = _time_status(dep2)
-            code2 = s2.get("scheduleMetadata", {}).get("trainReportingIdentity", "-")
-            badge = _status_badge(
+            code2    = s2.get("scheduleMetadata", {}).get("trainReportingIdentity", "-")
+            arr2_str = conn["leg2_arr"].strftime("%H:%M") if conn.get("leg2_arr") else "-"
+            badge    = _status_badge(
                 (s2.get("temporalData") or {}).get("displayAs", "CALL"),
                 s2.get("temporalData") or {},
                 s2.get("reasons") or [],
@@ -626,6 +638,7 @@ def display_route(route: dict, route_name: str, time_from: str) -> None:
         else:
             dep2_text = Text("No service", style="red")
             code2     = "-"
+            arr2_str  = "-"
             badge     = Text("No connection", style="bold red")
 
         tbl.add_row(
@@ -635,6 +648,7 @@ def display_route(route: dict, route_name: str, time_from: str) -> None:
             arr1_str,
             dep2_text,
             code2,
+            arr2_str,
             badge,
         )
 
