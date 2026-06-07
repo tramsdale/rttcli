@@ -259,7 +259,11 @@ class TestDisplayDepartures:
 
     def test_returns_services_list(self):
         data = {
-            "query": {"location": {"description": "London Paddington"}, "timeFrom": "2026-06-07T21:00:00"},
+            "query": {
+                "location": {"description": "London Paddington"},
+                "filterTo": {"description": "Bristol Temple Meads"},
+                "timeFrom": "2026-06-07T21:00:00",
+            },
             "services": [self._make_service("21:30", "Bristol Temple Meads")],
         }
         with patch.object(rtt.console, "print"):
@@ -278,6 +282,31 @@ class TestDisplayDepartures:
         # Confirm the fixture nests it correctly
         assert svc["destination"][0].get("description") is None
         assert svc["destination"][0]["location"]["description"] == "Bristol Temple Meads"
+
+    def test_header_shows_expanded_names_and_codes(self):
+        data = {
+            "query": {
+                "location": {"description": "London Kings Cross"},
+                "filterTo": {"description": "Cambridge"},
+                "timeFrom": "2026-06-07T21:00:00",
+            },
+            "services": [],
+        }
+        printed = []
+        with patch.object(rtt.console, "print", side_effect=lambda *a, **k: printed.append(str(a))):
+            display_departures(data, "KGX", "CBG")
+        header = next(s for s in printed if "Kings Cross" in s)
+        assert "London Kings Cross (KGX)" in header
+        assert "Cambridge (CBG)" in header
+
+    def test_header_falls_back_to_crs_when_no_query(self):
+        data = {"query": {}, "services": []}
+        printed = []
+        with patch.object(rtt.console, "print", side_effect=lambda *a, **k: printed.append(str(a))):
+            display_departures(data, "PAD", "BRI")
+        header = next(s for s in printed if "PAD" in s)
+        assert "(PAD)" in header
+        assert "(BRI)" in header
 
     def test_multiple_services_all_returned(self):
         data = {

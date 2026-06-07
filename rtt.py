@@ -251,10 +251,15 @@ def display_departures(data: dict, from_crs: str, to_crs: str) -> list:
     services = data.get("services") or []
     query = data.get("query", {})
     loc_name = query.get("location", {}).get("description", from_crs.upper())
+    filter_to = query.get("filterTo", {})
+    dest_name = filter_to.get("description", to_crs.upper())
     time_from = fmt_iso(query.get("timeFrom", ""))
 
+    from_label = f"{loc_name} ({from_crs.upper()})"
+    to_label = f"{dest_name} ({to_crs.upper()})"
+
     console.print()
-    title = f"[bold]Trains from [cyan]{loc_name}[/cyan] → [cyan]{to_crs.upper()}[/cyan][/bold]"
+    title = f"[bold]Trains from [cyan]{from_label}[/cyan] → [cyan]{to_label}[/cyan][/bold]"
     if time_from:
         title += f"  [dim]from {time_from}[/dim]"
     console.print(title)
