@@ -1,7 +1,7 @@
 """Tests for rtt.py — pure functions and display logic."""
 
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,10 +12,14 @@ from rtt import (
     _time_status,
     display_departures,
     display_service_detail,
+    find_arrival_at,
+    find_next_service_after,
     fmt_iso,
+    get_terminus_arrival,
     next_weekday,
     parse_date,
     parse_hhmm,
+    parse_iso_naive,
 )
 
 
@@ -228,6 +232,134 @@ class TestStatusBadge:
 
     def test_scheduled_no_realtime(self):
         assert self._badge_text("CALL", {}) == "Scheduled"
+
+
+# ── parse_iso_naive ───────────────────────────────────────────────────────────
+
+class TestParseIsoNaive:
+    def test_basic(self):
+        assert parse_iso_naive("2026-06-07T21:30:00") == datetime(2026, 6, 7, 21, 30, 0)
+
+    def test_strips_timezone(self):
+        assert parse_iso_naive("2026-06-07T21:30:00+01:00") == datetime(2026, 6, 7, 21, 30, 0)
+
+    def test_strips_z(self):
+        assert parse_iso_naive("2026-06-07T09:05:00Z") == datetime(2026, 6, 7, 9, 5, 0)
+
+    def test_none_returns_none(self):
+        assert parse_iso_naive(None) is None
+
+    def test_empty_returns_none(self):
+        assert parse_iso_naive("") is None
+
+    def test_invalid_returns_none(self):
+        assert parse_iso_naive("not-a-date") is None
+
+
+# ── get_terminus_arrival ──────────────────────────────────────────────────────
+
+class TestGetTerminusArrival:
+    def _make_svc(self, dest_codes, arrival_time):
+        return {
+            "destination": [{
+                "location": {"shortCodes": dest_codes, "longCodes": []},
+                "temporalData": {"scheduleAdvertised": arrival_time},
+            }]
+        }
+
+    def test_matches_short_code(self):
+        svc = self._make_svc(["PAD"], "2026-06-07T09:05:00")
+        result = get_terminus_arrival(svc, "PAD")
+        assert result == datetime(2026, 6, 7, 9, 5, 0)
+
+    def test_case_insensitive(self):
+        svc = self._make_svc(["PAD"], "2026-06-07T09:05:00")
+        assert get_terminus_arrival(svc, "pad") is not None
+
+    def test_no_match_returns_none(self):
+        svc = self._make_svc(["KGX"], "2026-06-07T09:05:00")
+        assert get_terminus_arrival(svc, "PAD") is None
+
+    def test_empty_destination_returns_none(self):
+        assert get_terminus_arrival({"destination": []}, "PAD") is None
+
+
+# ── find_arrival_at ───────────────────────────────────────────────────────────
+
+class TestFindArrivalAt:
+    def _make_detail(self, stops):
+        """stops: list of (crs, arrival_time_str)"""
+        return {
+            "service": {
+                "locations": [
+                    {
+                        "location": {"shortCodes": [crs]},
+                        "temporalData": {
+                            "arrival": {"scheduleAdvertised": arr_time},
+                        },
+                    }
+                    for crs, arr_time in stops
+                ]
+            }
+        }
+
+    def test_finds_station(self):
+        data = self._make_detail([("PAD", "2026-06-07T09:05:00"), ("BRI", "2026-06-07T10:00:00")])
+        assert find_arrival_at(data, "PAD") == datetime(2026, 6, 7, 9, 5, 0)
+
+    def test_finds_intermediate_stop(self):
+        data = self._make_detail([
+            ("BRI", "2026-06-07T07:30:00"),
+            ("RDG", "2026-06-07T08:45:00"),
+            ("PAD", "2026-06-07T09:05:00"),
+        ])
+        assert find_arrival_at(data, "RDG") == datetime(2026, 6, 7, 8, 45, 0)
+
+    def test_missing_station_returns_none(self):
+        data = self._make_detail([("PAD", "2026-06-07T09:05:00")])
+        assert find_arrival_at(data, "CBG") is None
+
+    def test_handles_top_level_data_without_service_key(self):
+        data = {
+            "locations": [{
+                "location": {"shortCodes": ["PAD"]},
+                "temporalData": {"arrival": {"scheduleAdvertised": "2026-06-07T09:05:00"}},
+            }]
+        }
+        assert find_arrival_at(data, "PAD") == datetime(2026, 6, 7, 9, 5, 0)
+
+
+# ── find_next_service_after ───────────────────────────────────────────────────
+
+class TestFindNextServiceAfter:
+    def _make_services(self, dep_times):
+        return [
+            {
+                "temporalData": {
+                    "departure": {"scheduleAdvertised": f"2026-06-07T{t}:00"}
+                }
+            }
+            for t in dep_times
+        ]
+
+    def test_returns_first_at_or_after(self):
+        svcs = self._make_services(["08:00", "08:30", "09:00"])
+        earliest = datetime(2026, 6, 7, 8, 30, 0)
+        result = find_next_service_after(svcs, earliest)
+        dep = result["temporalData"]["departure"]["scheduleAdvertised"]
+        assert "08:30" in dep
+
+    def test_returns_exact_match(self):
+        svcs = self._make_services(["09:00", "09:30"])
+        result = find_next_service_after(svcs, datetime(2026, 6, 7, 9, 0, 0))
+        assert "09:00" in result["temporalData"]["departure"]["scheduleAdvertised"]
+
+    def test_returns_none_when_all_too_early(self):
+        svcs = self._make_services(["07:00", "07:30"])
+        assert find_next_service_after(svcs, datetime(2026, 6, 7, 10, 0, 0)) is None
+
+    def test_empty_list_returns_none(self):
+        assert find_next_service_after([], datetime(2026, 6, 7, 9, 0, 0)) is None
 
 
 # ── display_departures ────────────────────────────────────────────────────────

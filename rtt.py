@@ -53,6 +53,31 @@ def save_token(token: str) -> None:
     console.print(f"[green]Token saved to {CONFIG_PATH}[/green]")
 
 
+def save_route(name: str, leg1_from: str, leg1_to: str, leg2_from: str, leg2_to: str, transfer: int) -> None:
+    cfg = load_config()
+    cfg.setdefault("routes", {})[name] = {
+        "legs": [[leg1_from.upper(), leg1_to.upper()], [leg2_from.upper(), leg2_to.upper()]],
+        "transfer": transfer,
+    }
+    save_config(cfg)
+    console.print(
+        f"[green]Route '[bold]{name}[/bold]' saved:[/green] "
+        f"{leg1_from.upper()}→{leg1_to.upper()}  +{transfer}min  {leg2_from.upper()}→{leg2_to.upper()}"
+    )
+
+
+def list_routes() -> None:
+    routes = load_config().get("routes", {})
+    if not routes:
+        console.print("[yellow]No saved routes.[/yellow] Add one with: rtt config --add-route NAME FROM1 TO1 FROM2 TO2")
+        return
+    console.print("\n[bold]Saved routes:[/bold]")
+    for name, r in routes.items():
+        legs = r["legs"]
+        transfer = r.get("transfer", 25)
+        console.print(f"  [bold cyan]{name}[/bold cyan]  {legs[0][0]}→{legs[0][1]}  [dim]+{transfer}min[/dim]  {legs[1][0]}→{legs[1][1]}")
+
+
 def get_access_token() -> str:
     """
     Return a valid access token, exchanging the refresh token if needed.
@@ -135,6 +160,53 @@ def fmt_iso(dt_str: str | None) -> str:
     if not dt_str:
         return ""
     return dt_str[11:16]  # "2026-06-07T21:30:00Z" → "21:30"
+
+
+def parse_iso_naive(s: str | None) -> datetime | None:
+    """Parse an ISO 8601 string to a naive datetime (strips timezone)."""
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+
+
+def get_terminus_arrival(svc: dict, target_crs: str) -> datetime | None:
+    """Return arrival time at target_crs if it appears as the service's terminus destination."""
+    for dest in svc.get("destination") or []:
+        loc = dest.get("location", {})
+        codes = (loc.get("shortCodes") or []) + (loc.get("longCodes") or [])
+        if target_crs.upper() in [c.upper() for c in codes]:
+            timing = dest.get("temporalData") or {}
+            t = timing.get("scheduleAdvertised") or timing.get("scheduleInternal")
+            return parse_iso_naive(t)
+    return None
+
+
+def find_arrival_at(service_data: dict, crs: str) -> datetime | None:
+    """Return arrival datetime at crs from a service detail response (searches all locations)."""
+    svc = service_data.get("service", service_data)
+    for loc in svc.get("locations") or []:
+        codes = (loc.get("location") or {}).get("shortCodes") or []
+        if any(c.upper() == crs.upper() for c in codes):
+            timing = (loc.get("temporalData") or {}).get("arrival") or {}
+            t = timing.get("realtimeActual") or timing.get("realtimeForecast") or \
+                timing.get("scheduleAdvertised") or timing.get("scheduleInternal")
+            return parse_iso_naive(t)
+    return None
+
+
+def find_next_service_after(services: list, earliest: datetime) -> dict | None:
+    """Return the first service whose scheduled departure is at or after earliest."""
+    for svc in services:
+        dep = (svc.get("temporalData") or {}).get("departure") or {}
+        t_str = dep.get("realtimeActual") or dep.get("realtimeForecast") or \
+                dep.get("scheduleAdvertised") or dep.get("scheduleInternal")
+        t = parse_iso_naive(t_str)
+        if t and t >= earliest:
+            return svc
+    return None
 
 
 # ── API calls ─────────────────────────────────────────────────────────────────
@@ -441,15 +513,163 @@ def display_service_detail(data: dict, highlight_crs: str | None = None) -> None
     console.print(tbl)
 
 
+# ── Display: multi-leg route ──────────────────────────────────────────────────
+
+_DEP_STYLES: dict[str, str] = {
+    "cancelled": "strike red",
+    "delayed": "yellow",
+    "on_time": "green",
+    "scheduled": "",
+}
+
+
+def display_route(route: dict, route_name: str, time_from: str) -> None:
+    legs = route["legs"]
+    transfer_mins = route.get("transfer", 25)
+    leg1_from, leg1_to = legs[0]
+    leg2_from, leg2_to = legs[1]
+
+    # ── Leg 1 search ──
+    console.print(f"\n[dim]Searching {leg1_from}→{leg1_to}…[/dim]")
+    leg1_data = api_search(leg1_from, leg1_to, time_from)
+    if not leg1_data or not leg1_data.get("services"):
+        console.print(f"[yellow]No {leg1_from}→{leg1_to} services found.[/yellow]")
+        return
+
+    leg1_services = leg1_data["services"]
+    q1 = leg1_data.get("query", {})
+    leg1_from_name = q1.get("location", {}).get("description", leg1_from)
+    leg1_to_name   = q1.get("filterTo", {}).get("description", leg1_to)
+
+    # ── For each leg 1 service, resolve arrival at interchange ──
+    connections = []
+    for svc in leg1_services[:5]:
+        sched_meta = svc.get("scheduleMetadata", {})
+        identity   = sched_meta.get("identity")
+        dep_date   = sched_meta.get("departureDate")
+        if not identity or not dep_date:
+            continue
+
+        # Try terminus shortcut first (avoids an API call when leg1_to is the train's terminus)
+        arr = get_terminus_arrival(svc, leg1_to)
+        if arr is None:
+            detail = api_service(identity, dep_date)
+            arr = find_arrival_at(detail, leg1_to)
+        if arr is None:
+            continue
+
+        connections.append({
+            "leg1_svc": svc,
+            "leg1_arr": arr,
+            "leg2_earliest": arr + timedelta(minutes=transfer_mins),
+        })
+
+    if not connections:
+        console.print(f"[yellow]Could not resolve arrival times at {leg1_to}.[/yellow]")
+        return
+
+    # ── Leg 2 search from earliest possible departure ──
+    earliest_leg2_dt = min(c["leg2_earliest"] for c in connections)
+    leg2_time_from   = earliest_leg2_dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+    console.print(f"[dim]Searching {leg2_from}→{leg2_to} from {earliest_leg2_dt.strftime('%H:%M')}…[/dim]")
+    leg2_data = api_search(leg2_from, leg2_to, leg2_time_from)
+    leg2_services = (leg2_data.get("services") or []) if leg2_data else []
+
+    q2 = (leg2_data or {}).get("query", {})
+    leg2_from_name = q2.get("location", {}).get("description", leg2_from)
+    leg2_to_name   = q2.get("filterTo", {}).get("description", leg2_to)
+
+    # Match each connection to the next available leg 2 service
+    for conn in connections:
+        conn["leg2_svc"] = find_next_service_after(leg2_services, conn["leg2_earliest"])
+
+    # ── Header ──
+    console.print()
+    console.print(
+        f"[bold]Route [cyan]{route_name}[/cyan]  "
+        f"{leg1_from_name} ({leg1_from}) → {leg1_to_name} ({leg1_to})  "
+        f"[dim]+{transfer_mins}min[/dim]  "
+        f"{leg2_from_name} ({leg2_from}) → {leg2_to_name} ({leg2_to})[/bold]"
+    )
+    console.print()
+
+    # ── Connection table ──
+    tbl = Table(box=box.ROUNDED, show_header=True, header_style="bold blue", padding=(0, 1), expand=False)
+    tbl.add_column("#",             style="dim", width=3,  min_width=3, justify="right", no_wrap=True)
+    tbl.add_column(f"{leg1_from} dep", width=8, min_width=5, no_wrap=True)
+    tbl.add_column("Code",          width=6,  min_width=4, no_wrap=True)
+    tbl.add_column(f"{leg1_to} arr",  width=8, min_width=5, no_wrap=True)
+    tbl.add_column(f"{leg2_from} dep", width=9, min_width=5, no_wrap=True)
+    tbl.add_column("Code",          width=6,  min_width=4, no_wrap=True)
+    tbl.add_column("Status",        width=22, min_width=8)
+
+    for i, conn in enumerate(connections, 1):
+        s1 = conn["leg1_svc"]
+        s2 = conn.get("leg2_svc")
+
+        dep1 = (s1.get("temporalData") or {}).get("departure") or {}
+        dep1_str, dep1_status = _time_status(dep1)
+        code1 = s1.get("scheduleMetadata", {}).get("trainReportingIdentity", "-")
+        arr1_str = conn["leg1_arr"].strftime("%H:%M")
+
+        if s2:
+            dep2 = (s2.get("temporalData") or {}).get("departure") or {}
+            dep2_str, dep2_status = _time_status(dep2)
+            code2 = s2.get("scheduleMetadata", {}).get("trainReportingIdentity", "-")
+            badge = _status_badge(
+                (s2.get("temporalData") or {}).get("displayAs", "CALL"),
+                s2.get("temporalData") or {},
+                s2.get("reasons") or [],
+            )
+            dep2_text = Text(dep2_str, style=_DEP_STYLES.get(dep2_status, ""))
+        else:
+            dep2_text = Text("No service", style="red")
+            code2     = "-"
+            badge     = Text("No connection", style="bold red")
+
+        tbl.add_row(
+            str(i),
+            Text(dep1_str, style=_DEP_STYLES.get(dep1_status, "")),
+            code1,
+            arr1_str,
+            dep2_text,
+            code2,
+            badge,
+        )
+
+    console.print(tbl)
+    console.print(
+        f"[dim]  Transfer: {transfer_mins} min at {leg1_to_name}  ·  "
+        f"Use  rtt {leg1_from} {leg1_to}  or  rtt {leg2_from} {leg2_to}  for individual legs[/dim]"
+    )
+
+
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
 def main() -> None:
-    # Handle `rtt config --token TOKEN` before argparse sees positional args
+    # Handle `rtt config …` before argparse sees positional args
     if len(sys.argv) >= 2 and sys.argv[1] == "config":
-        cfg = argparse.ArgumentParser(prog="rtt config")
-        cfg.add_argument("--token", required=True, metavar="TOKEN", help="RTT API Bearer token")
-        a = cfg.parse_args(sys.argv[2:])
-        save_token(a.token)
+        cfg_p = argparse.ArgumentParser(prog="rtt config")
+        grp = cfg_p.add_mutually_exclusive_group(required=True)
+        grp.add_argument("--token", metavar="TOKEN", help="RTT API Bearer token")
+        grp.add_argument(
+            "--add-route",
+            nargs=5,
+            metavar=("NAME", "FROM1", "TO1", "FROM2", "TO2"),
+            help="Save a two-leg route alias",
+        )
+        grp.add_argument("--list-routes", action="store_true", help="List saved routes")
+        cfg_p.add_argument("--transfer", type=int, default=25, metavar="MINS",
+                           help="Transfer time in minutes (default: 25)")
+        a = cfg_p.parse_args(sys.argv[2:])
+        if a.token:
+            save_token(a.token)
+        elif a.add_route:
+            name, f1, t1, f2, t2 = a.add_route
+            save_route(name, f1, t1, f2, t2, a.transfer)
+        else:
+            list_routes()
         return
 
     parser = argparse.ArgumentParser(
@@ -458,14 +678,17 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  rtt config --token eyJ...          save your API token
-  rtt PAD BRI                        next trains Paddington → Bristol
-  rtt PAD BRI --after 2100           trains after 21:00
-  rtt PAD BRI --tomorrow             tomorrow's trains
-  rtt PAD BRI --friday               next Friday's trains
-  rtt PAD BRI --date 7/6/26          specific date
-  rtt PAD BRI --detail 1             full calling points for first train
-  rtt PAD BRI --after 1800 --detail 2
+  rtt config --token eyJ...                    save your API token
+  rtt config --add-route rtn BRI PAD KGX CBG   save a two-leg route
+  rtt config --list-routes                     list saved routes
+  rtt PAD BRI                                  next trains Paddington → Bristol
+  rtt PAD BRI --after 2100                     trains after 21:00
+  rtt PAD BRI --tomorrow                       tomorrow's trains
+  rtt PAD BRI --friday                         next Friday's trains
+  rtt PAD BRI --date 7/6/26                    specific date
+  rtt PAD BRI --detail 1                       full calling points for first train
+  rtt rtn                                      run saved two-leg route
+  rtt rtn --tomorrow --after 0700
 """,
     )
 
@@ -489,7 +712,11 @@ examples:
 
     args = parser.parse_args()
 
-    if not args.from_station or not args.to_station:
+    # Detect named route: `rtt rtn` or `rtt rtn --tomorrow` etc.
+    saved_routes = load_config().get("routes", {})
+    is_route = bool(args.from_station and not args.to_station and args.from_station in saved_routes)
+
+    if not is_route and (not args.from_station or not args.to_station):
         parser.print_help()
         sys.exit(1)
 
@@ -527,7 +754,11 @@ examples:
         # Future date: start from first trains of the day
         time_from = f"{target_date}T06:00:00"
 
-    # ── Search ──
+    # ── Route or direct search ──
+    if is_route:
+        display_route(saved_routes[args.from_station], args.from_station, time_from)
+        return
+
     data = api_search(args.from_station, args.to_station, time_from)
 
     if data is None:
