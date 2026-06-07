@@ -197,6 +197,20 @@ def find_arrival_at(service_data: dict, crs: str) -> datetime | None:
     return None
 
 
+def resolve_arrivals(services: list, to_crs: str) -> list[datetime | None]:
+    """Return the arrival time at to_crs for each service, using service detail when needed."""
+    arrivals = []
+    for svc in services:
+        arr = get_terminus_arrival(svc, to_crs)
+        if arr is None:
+            meta = svc.get("scheduleMetadata", {})
+            identity, dep_date = meta.get("identity", ""), meta.get("departureDate", "")
+            if identity and dep_date:
+                arr = find_arrival_at(api_service(identity, dep_date), to_crs)
+        arrivals.append(arr)
+    return arrivals
+
+
 def find_next_service_after(services: list, earliest: datetime) -> dict | None:
     """Return the first service whose scheduled departure is at or after earliest."""
     for svc in services:
@@ -319,7 +333,8 @@ def _status_badge(display_as: str, temporal: dict, reasons: list) -> Text:
 
 # ── Display: departures board ─────────────────────────────────────────────────
 
-def display_departures(data: dict, from_crs: str, to_crs: str) -> list:
+def display_departures(data: dict, from_crs: str, to_crs: str,
+                       arrivals: list[datetime | None] | None = None) -> list:
     services = data.get("services") or []
     query = data.get("query", {})
     loc_name = query.get("location", {}).get("description", from_crs.upper())
@@ -346,7 +361,8 @@ def display_departures(data: dict, from_crs: str, to_crs: str) -> list:
     tbl.add_column("Departs", width=8, min_width=5, no_wrap=True)
     tbl.add_column("Code", width=6, min_width=4, no_wrap=True)
     tbl.add_column("Destination", width=24, min_width=16)
-    tbl.add_column("Operator", width=20, min_width=12)
+    tbl.add_column(f"{to_crs.upper()} arr", width=8, min_width=5, no_wrap=True)
+    tbl.add_column("Operator", width=20, min_width=12, no_wrap=True)
     tbl.add_column("Plat", width=4, min_width=4, no_wrap=True)
     tbl.add_column("Status", width=26, min_width=10)
 
@@ -369,19 +385,23 @@ def display_departures(data: dict, from_crs: str, to_crs: str) -> list:
         platform = platform_obj.get("actual") or platform_obj.get("planned") or "-"
 
         dep_timing = temporal.get("departure") or {}
-        dep_display, dep_status = _time_status(dep_timing)
-        dep_styles = {
-            "cancelled": "strike red",
-            "delayed": "yellow",
-            "on_time": "green",
-            "forecast": "cyan",
-            "scheduled": "",
-        }
-        dep_text = Text(dep_display, style=dep_styles.get(dep_status, ""))
+        _, dep_status = _time_status(dep_timing)
+        # Show the actual/forecast time when available (status badge handles the +Nm detail)
+        dep_time = fmt_iso(
+            dep_timing.get("realtimeActual") or dep_timing.get("realtimeForecast")
+            or dep_timing.get("scheduleAdvertised") or dep_timing.get("scheduleInternal")
+        )
+        dep_text = Text(
+            dep_time or "-",
+            style=_DEP_STYLES.get(dep_status, "") if not dep_timing.get("isCancelled") else "strike red",
+        )
 
         badge = _status_badge(display_as, temporal, reasons)
 
-        tbl.add_row(str(i), dep_text, headcode, dest, operator, platform, badge)
+        arr_dt = arrivals[i - 1] if arrivals and i - 1 < len(arrivals) else None
+        arr_str = arr_dt.strftime("%H:%M") if arr_dt else "-"
+
+        tbl.add_row(str(i), dep_text, headcode, dest, arr_str, operator, platform, badge)
 
     console.print(tbl)
     console.print(f"[dim]  Use --detail N to show full calling points for train #N[/dim]")
@@ -779,7 +799,9 @@ examples:
         console.print("[yellow]No services found for this query.[/yellow]")
         return
 
-    services = display_departures(data, args.from_station, args.to_station)
+    raw_services = data.get("services") or []
+    arrivals = resolve_arrivals(raw_services, args.to_station)
+    services = display_departures(data, args.from_station, args.to_station, arrivals)
 
     # ── Detail view ──
     if args.detail is not None:

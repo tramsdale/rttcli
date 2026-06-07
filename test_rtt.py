@@ -20,6 +20,7 @@ from rtt import (
     parse_date,
     parse_hhmm,
     parse_iso_naive,
+    resolve_arrivals,
 )
 
 
@@ -365,6 +366,46 @@ class TestFindNextServiceAfter:
         svcs = self._make_services(["08:00", "09:00", "10:00"])
         result = find_next_service_after(svcs, datetime(2026, 6, 7, 9, 30, 0))
         assert "10:00" in result["temporalData"]["departure"]["scheduleAdvertised"]
+
+
+# ── resolve_arrivals ──────────────────────────────────────────────────────────
+
+class TestResolveArrivals:
+    def _make_svc_with_terminus(self, dest_crs, arr_time):
+        return {
+            "destination": [{
+                "location": {"shortCodes": [dest_crs], "longCodes": []},
+                "temporalData": {"scheduleAdvertised": arr_time},
+            }],
+            "scheduleMetadata": {"identity": "X001", "departureDate": "2026-06-07"},
+        }
+
+    def test_uses_terminus_when_available(self):
+        svcs = [self._make_svc_with_terminus("PAD", "2026-06-07T09:05:00")]
+        result = resolve_arrivals(svcs, "PAD")
+        assert result == [datetime(2026, 6, 7, 9, 5, 0)]
+
+    def test_returns_none_when_no_match_and_no_identity(self):
+        svcs = [{"destination": [], "scheduleMetadata": {}}]
+        result = resolve_arrivals(svcs, "PAD")
+        assert result == [None]
+
+    def test_length_matches_services(self):
+        svcs = [
+            self._make_svc_with_terminus("PAD", "2026-06-07T09:05:00"),
+            self._make_svc_with_terminus("PAD", "2026-06-07T09:35:00"),
+        ]
+        result = resolve_arrivals(svcs, "PAD")
+        assert len(result) == 2
+
+    def test_mixed_terminus_and_none(self):
+        svcs = [
+            self._make_svc_with_terminus("PAD", "2026-06-07T09:05:00"),
+            {"destination": [], "scheduleMetadata": {}},  # no terminus match, no identity
+        ]
+        result = resolve_arrivals(svcs, "PAD")
+        assert result[0] == datetime(2026, 6, 7, 9, 5, 0)
+        assert result[1] is None
 
 
 # ── display_departures ────────────────────────────────────────────────────────
