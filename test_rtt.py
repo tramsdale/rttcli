@@ -598,8 +598,8 @@ class TestDisplayServiceDetail:
         with patch.object(rtt.console, "print"), patch("rtt.Table", CapturingTable):
             display_service_detail(data, highlight_crs="BRI")
 
-        assert any("▶" in n and "Bristol" in n for n in rendered_names)
-        assert not any("▶" in n and "Paddington" in n for n in rendered_names)
+        assert any("↓" in n and "Bristol" in n for n in rendered_names)
+        assert not any("↓" in n and "Paddington" in n for n in rendered_names)
 
     def test_service_key_unwrapped(self):
         """Data must be read from data['service'], not data directly."""

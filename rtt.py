@@ -410,7 +410,7 @@ def display_departures(data: dict, from_crs: str, to_crs: str,
 
 # ── Display: service detail ───────────────────────────────────────────────────
 
-def display_service_detail(data: dict, highlight_crs: str | None = None) -> None:
+def display_service_detail(data: dict, highlight_crs: str | None = None, board_crs: str | None = None) -> None:
     # Top-level response wraps everything inside a 'service' key
     svc_data = data.get("service", data)
     sched_meta = svc_data.get("scheduleMetadata", {})
@@ -480,6 +480,9 @@ def display_service_detail(data: dict, highlight_crs: str | None = None) -> None
         is_highlight = highlight_crs and any(
             c.upper() == highlight_crs.upper() for c in short_codes
         )
+        is_board = board_crs and any(
+            c.upper() == board_crs.upper() for c in short_codes
+        )
 
         platform_obj = loc_meta.get("platform") or {}
         plat_plan = platform_obj.get("planned") or "-"
@@ -523,8 +526,10 @@ def display_service_detail(data: dict, highlight_crs: str | None = None) -> None
             name_text = Text(name, style="magenta")
         elif display_as in ("STARTS", "TERMINATES"):
             name_text = Text(name, style="bold")
+        elif is_board:
+            name_text = Text(f"↑ {name}", style="bold green")
         elif is_highlight:
-            name_text = Text(f"▶ {name}", style="bold cyan")
+            name_text = Text(f"↓ {name}", style="bold cyan")
         else:
             name_text = Text(name)
 
@@ -595,8 +600,9 @@ def display_route(route: dict, route_name: str, time_from: str, detail: int | No
         console.print(f"[yellow]Could not resolve arrival times at {leg1_to}.[/yellow]")
         return
 
-    # ── Leg 2 search from earliest possible departure ──
-    earliest_leg2_dt = min(c["leg2_earliest"] for c in connections)
+    # ── Leg 2 search: start from earliest leg 1 arrival so we can also detect
+    # ── services a connection would just miss (for greyed-out context rows).
+    earliest_leg2_dt = min(c["leg1_arr"] for c in connections)
     leg2_time_from   = earliest_leg2_dt.strftime("%Y-%m-%dT%H:%M:%S")
 
     console.print(f"[dim]Searching {leg2_from}→{leg2_to} from {earliest_leg2_dt.strftime('%H:%M')}…[/dim]")
@@ -607,8 +613,17 @@ def display_route(route: dict, route_name: str, time_from: str, detail: int | No
     leg2_from_name = q2.get("location", {}).get("description", leg2_from)
     leg2_to_name   = q2.get("filterTo", {}).get("description", leg2_to)
 
-    # Match each connection to the next available leg 2 service, and resolve its arrival
+    # For each leg 1 connection resolve:
+    #   missed_s2  — first leg 2 after leg1_arr but before leg2_earliest (they'd miss it)
+    #   leg2_svc   — first leg 2 at or after leg2_earliest (the actual connection)
     for conn in connections:
+        # Service they'd be running for but can't reach in time
+        candidate = find_next_service_after(leg2_services, conn["leg1_arr"])
+        if candidate and candidate is not find_next_service_after(leg2_services, conn["leg2_earliest"]):
+            conn["missed_s2"] = candidate
+        else:
+            conn["missed_s2"] = None
+
         s2 = find_next_service_after(leg2_services, conn["leg2_earliest"])
         conn["leg2_svc"] = s2
         if s2 is None:
@@ -640,17 +655,59 @@ def display_route(route: dict, route_name: str, time_from: str, detail: int | No
     tbl.add_column(f"{leg2_from} dep", width=9, min_width=5, no_wrap=True)
     tbl.add_column("Code",          width=6,  min_width=4, no_wrap=True)
     tbl.add_column(f"{leg2_to} arr",  width=8, min_width=5, no_wrap=True)
+    tbl.add_column("Margin",        width=12, min_width=8, no_wrap=True)
     tbl.add_column("Status",        width=22, min_width=8)
 
+    def _margin_text(dep2_timing: dict, leg1_arr: datetime) -> tuple[int | None, "Text"]:
+        dep2_dt = parse_iso_naive(
+            dep2_timing.get("realtimeActual") or dep2_timing.get("realtimeForecast") or dep2_timing.get("scheduleAdvertised")
+        )
+        if dep2_dt is None:
+            return None, Text("-", style="dim")
+        total = int((dep2_dt - leg1_arr).total_seconds() // 60)
+        mins = total - transfer_mins
+        suffix = f" ({total}m)"
+        if mins < 0:
+            return mins, Text(f"{mins}m{suffix}", style="dim")
+        elif mins <= 5:
+            return mins, Text(f"+{mins}m{suffix}", style="yellow")
+        else:
+            return mins, Text(f"+{mins}m{suffix}", style="green")
+
+    def _dim_row(tbl: "Table", num_str: str, dep1_str: str, dep1_status: str,
+                 code1: str, arr1_str: str, s2: dict, leg1_arr: datetime) -> None:
+        """Add a greyed-out row for a leg 2 service the traveller would miss."""
+        dep2 = (s2.get("temporalData") or {}).get("departure") or {}
+        dep2_str, _ = _time_status(dep2)
+        code2 = s2.get("scheduleMetadata", {}).get("trainReportingIdentity", "-")
+        _, margin_text = _margin_text(dep2, leg1_arr)
+        tbl.add_row(
+            Text("", style="dim"),
+            Text("", style="dim"),
+            Text("", style="dim"),
+            Text("", style="dim"),
+            Text(dep2_str, style="dim"),
+            Text(code2, style="dim"),
+            Text("-", style="dim"),
+            margin_text,
+            Text("", style="dim"),
+        )
+
     for i, conn in enumerate(connections, 1):
-        s1 = conn["leg1_svc"]
-        s2 = conn.get("leg2_svc")
+        s1   = conn["leg1_svc"]
+        s2   = conn.get("leg2_svc")
+        ms2  = conn.get("missed_s2")
 
         dep1 = (s1.get("temporalData") or {}).get("departure") or {}
         dep1_str, dep1_status = _time_status(dep1)
-        code1 = s1.get("scheduleMetadata", {}).get("trainReportingIdentity", "-")
+        code1    = s1.get("scheduleMetadata", {}).get("trainReportingIdentity", "-")
         arr1_str = conn["leg1_arr"].strftime("%H:%M")
 
+        # Greyed context row for the service they'd just miss
+        if ms2:
+            _dim_row(tbl, str(i), dep1_str, dep1_status, code1, arr1_str, ms2, conn["leg1_arr"])
+
+        # Normal row: actual connection (or no-connection)
         if s2:
             dep2 = (s2.get("temporalData") or {}).get("departure") or {}
             dep2_str, dep2_status = _time_status(dep2)
@@ -661,21 +718,25 @@ def display_route(route: dict, route_name: str, time_from: str, detail: int | No
                 s2.get("temporalData") or {},
                 s2.get("reasons") or [],
             )
-            dep2_text = Text(dep2_str, style=_DEP_STYLES.get(dep2_status, ""))
+            _, margin_text = _margin_text(dep2, conn["leg1_arr"])
+            dep2_cell = Text(dep2_str, style=_DEP_STYLES.get(dep2_status, ""))
         else:
-            dep2_text = Text("No service", style="red")
-            code2     = "-"
-            arr2_str  = "-"
-            badge     = Text("No connection", style="bold red")
+            dep2_cell   = Text("-", style="dim")
+            code2       = "-"
+            arr2_str    = "-"
+            margin_text = Text("-", style="dim")
+            badge       = Text("No connection", style="bold red")
 
+        num_cell = Text(str(i), style="dim") if ms2 else Text(str(i), style="dim")
         tbl.add_row(
-            str(i),
+            num_cell,
             Text(dep1_str, style=_DEP_STYLES.get(dep1_status, "")),
             code1,
             arr1_str,
-            dep2_text,
+            dep2_cell,
             code2,
             arr2_str,
+            margin_text,
             badge,
         )
 
@@ -697,12 +758,12 @@ def display_route(route: dict, route_name: str, time_from: str, detail: int | No
 
         m1 = s1.get("scheduleMetadata", {})
         console.print(f"\n[dim]Leg 1 detail: {m1.get('identity')} on {m1.get('departureDate')}…[/dim]")
-        display_service_detail(api_service(m1["identity"], m1["departureDate"]), highlight_crs=leg1_to)
+        display_service_detail(api_service(m1["identity"], m1["departureDate"]), board_crs=leg1_from, highlight_crs=leg1_to)
 
         if s2:
             m2 = s2.get("scheduleMetadata", {})
             console.print(f"\n[dim]Leg 2 detail: {m2.get('identity')} on {m2.get('departureDate')}…[/dim]")
-            display_service_detail(api_service(m2["identity"], m2["departureDate"]), highlight_crs=leg2_to)
+            display_service_detail(api_service(m2["identity"], m2["departureDate"]), board_crs=leg2_from, highlight_crs=leg2_to)
         else:
             console.print("[yellow]No leg 2 service to show detail for.[/yellow]")
 

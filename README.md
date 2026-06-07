@@ -4,10 +4,17 @@ A command-line interface for [Real Time Trains](https://www.realtimetrains.co.uk
 
 ## Requirements
 
-- [uv](https://docs.astral.sh/uv/)
-- A Real Time Trains API token from [api-portal.rtt.io](https://api-portal.rtt.io)
+- [uv](https://docs.astral.sh/uv/) — Python package manager (handles dependencies automatically)
+- A Real Time Trains API account (free) — see below
 
-## Setup
+## Getting an API key
+
+1. Go to [api-portal.rtt.io](https://api-portal.rtt.io) and create a free account
+2. Once logged in, go to **My Account → Subscriptions**
+3. Subscribe to the **RTT API** product (the free tier is sufficient)
+4. Your API token will be shown under **My Account → Profile** — copy the **Primary key**
+
+## Installation
 
 Clone the repo and symlink the script somewhere on your `$PATH`:
 
@@ -17,19 +24,24 @@ cd rttcli
 ln -s "$PWD/rtt.py" ~/.local/bin/rtt
 ```
 
+> `~/.local/bin` must be on your `$PATH`. On most Linux/macOS systems it is by default; if not, add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile.
+
 Save your API token:
 
 ```bash
 rtt config --token YOUR_TOKEN
 ```
 
-The token and a cached access token are stored in `~/.config/rtt/config.json`. The CLI handles token refresh automatically.
+The token is stored in `~/.config/rtt/config.json`. The CLI exchanges it for a short-lived access token automatically and caches it — you don't need to do anything else.
 
 ## Usage
 
 ```
 rtt FROM TO [options]
+rtt ROUTE_NAME [options]
 ```
+
+Station codes are standard CRS codes (three letters, e.g. `PAD`, `BRI`, `WAT`, `EUS`, `KGX`). You can look these up at [realtimetrains.co.uk](https://www.realtimetrains.co.uk/).
 
 ### Examples
 
@@ -48,15 +60,50 @@ rtt PAD BRI --after 1800 --detail 2
 | Option | Description |
 |---|---|
 | `--after HHMM` | Show trains departing after this time (e.g. `2100`) |
-| `--tomorrow` | Show trains for tomorrow |
-| `--monday` … `--sunday` | Show trains for the next occurrence of that weekday |
+| `--tomorrow` | Show trains for tomorrow from 06:00 |
+| `--monday` … `--sunday` | Show trains for the next occurrence of that weekday (always next week if today matches) |
 | `--date DD/MM/YY` | Show trains for a specific date |
 | `--detail N` | Show full calling points for train #N in the list |
 
-Station codes are standard CRS codes (e.g. `PAD`, `BRI`, `WAT`, `EUS`).
-
 ## Output
 
-**Departure board** — shows scheduled/actual departure time, headcode, destination, operator, platform, and live status (on time, delayed with reason, cancelled).
+**Departure board** — scheduled and actual departure times, headcode, destination, operator, platform, and live status (on time, delayed with reason, cancelled).
 
-**Detail view** (`--detail N`) — shows all calling points with arrival and departure times, platforms, delay reasons, and highlights your destination station.
+**Detail view** (`--detail N`) — all calling points with arrival and departure times, platforms, and delay reasons. Your boarding station is marked `↑` in green and your alighting station `↓` in cyan.
+
+## Route aliases
+
+For a journey with an interchange (e.g. train + underground), you can save a named two-leg route:
+
+```bash
+rtt config --add-route NAME FROM1 TO1 FROM2 TO2 [--transfer MINS]
+```
+
+The `--transfer` flag sets the minimum interchange time in minutes (default: 25). Once saved, run the route by name:
+
+```bash
+rtt NAME
+rtt NAME --friday --after 0800
+rtt NAME --detail 2
+```
+
+### Example
+
+```bash
+# Save a commute route: Bristol → Paddington, then King's Cross → Cambridge
+rtt config --add-route commute BRI PAD KGX CBG --transfer 30
+
+# Run it
+rtt commute
+rtt commute --tomorrow --detail 1
+```
+
+### Route output
+
+The route table shows each leg 1 train alongside the leg 2 connection it makes, with a **Margin** column showing spare time beyond the required transfer (e.g. `+8m (38m)` means 8 minutes to spare, 38 minutes total between trains). Rows where the transfer time is too tight are shown greyed out above the row for the connection you would actually catch.
+
+List your saved routes:
+
+```bash
+rtt config --list-routes
+```
