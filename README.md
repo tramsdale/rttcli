@@ -48,11 +48,13 @@ Station codes are standard CRS codes (three letters, e.g. `PAD`, `BRI`, `WAT`, `
 ```bash
 rtt PAD BRI                        # next trains from Paddington to Bristol
 rtt PAD BRI --after 2100           # trains after 21:00 today
+rtt PAD BRI --arriveby 1000        # trains arriving in Bristol by 10:00
 rtt PAD BRI --tomorrow             # tomorrow's trains from 06:00
 rtt PAD BRI --friday               # next Friday's trains
 rtt PAD BRI --date 9/6/26          # trains on a specific date (DD/MM/YY)
 rtt PAD BRI --detail 1             # full calling points for the first train
 rtt PAD BRI --after 1800 --detail 2
+rtt PAD BRI --friday --arriveby 1200
 ```
 
 ### Options
@@ -60,6 +62,7 @@ rtt PAD BRI --after 1800 --detail 2
 | Option | Description |
 |---|---|
 | `--after HHMM` | Show trains departing after this time (e.g. `2100`) |
+| `--arriveby HHMM` | Show trains arriving at the destination by this time, plus the next train after |
 | `--tomorrow` | Show trains for tomorrow from 06:00 |
 | `--monday` … `--sunday` | Show trains for the next occurrence of that weekday (always next week if today matches) |
 | `--date DD/MM/YY` | Show trains for a specific date |

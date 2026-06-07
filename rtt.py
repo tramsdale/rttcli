@@ -334,7 +334,8 @@ def _status_badge(display_as: str, temporal: dict, reasons: list) -> Text:
 # ── Display: departures board ─────────────────────────────────────────────────
 
 def display_departures(data: dict, from_crs: str, to_crs: str,
-                       arrivals: list[datetime | None] | None = None) -> list:
+                       arrivals: list[datetime | None] | None = None,
+                       arriveby_label: str | None = None) -> list:
     services = data.get("services") or []
     query = data.get("query", {})
     loc_name = query.get("location", {}).get("description", from_crs.upper())
@@ -347,7 +348,9 @@ def display_departures(data: dict, from_crs: str, to_crs: str,
 
     console.print()
     title = f"[bold]Trains from [cyan]{from_label}[/cyan] → [cyan]{to_label}[/cyan][/bold]"
-    if time_from:
+    if arriveby_label:
+        title += f"  [dim]arriving by {arriveby_label}[/dim]"
+    elif time_from:
         title += f"  [dim]from {time_from}[/dim]"
     console.print(title)
     console.print()
@@ -555,7 +558,8 @@ _DEP_STYLES: dict[str, str] = {
 }
 
 
-def display_route(route: dict, route_name: str, time_from: str, detail: int | None = None) -> None:
+def display_route(route: dict, route_name: str, time_from: str, detail: int | None = None,
+                  arriveby_dt: datetime | None = None) -> None:
     legs = route["legs"]
     transfer_mins = route.get("transfer", 25)
     leg1_from, leg1_to = legs[0]
@@ -574,8 +578,10 @@ def display_route(route: dict, route_name: str, time_from: str, detail: int | No
     leg1_to_name   = q1.get("filterTo", {}).get("description", leg1_to)
 
     # ── For each leg 1 service, resolve arrival at interchange ──
+    # When filtering by arriveby, fetch more trains so we have enough before the cutoff
+    leg1_limit = len(leg1_services) if arriveby_dt else 5
     connections = []
-    for svc in leg1_services[:5]:
+    for svc in leg1_services[:leg1_limit]:
         sched_meta = svc.get("scheduleMetadata", {})
         identity   = sched_meta.get("identity")
         dep_date   = sched_meta.get("departureDate")
@@ -635,6 +641,19 @@ def display_route(route: dict, route_name: str, time_from: str, detail: int | No
             detail2 = api_service(s2_meta.get("identity", ""), s2_meta.get("departureDate", ""))
             arr2 = find_arrival_at(detail2, leg2_to)
         conn["leg2_arr"] = arr2
+
+    # ── Filter by arriveby (final leg 2 arrival) ──
+    if arriveby_dt:
+        filtered_conns = []
+        first_after = False
+        for conn in connections:
+            arr2 = conn.get("leg2_arr")
+            if arr2 is None or arr2 <= arriveby_dt:
+                filtered_conns.append(conn)
+            elif not first_after:
+                filtered_conns.append(conn)
+                first_after = True
+        connections = filtered_conns
 
     # ── Header ──
     console.print()
@@ -806,6 +825,7 @@ examples:
   rtt config --list-routes                     list saved routes
   rtt PAD BRI                                  next trains Paddington → Bristol
   rtt PAD BRI --after 2100                     trains after 21:00
+  rtt PAD BRI --arriveby 1000                  trains arriving by 10:00
   rtt PAD BRI --tomorrow                       tomorrow's trains
   rtt PAD BRI --friday                         next Friday's trains
   rtt PAD BRI --date 7/6/26                    specific date
@@ -819,6 +839,7 @@ examples:
     parser.add_argument("to_station", nargs="?", help="Destination CRS code (e.g. BRI)")
 
     parser.add_argument("--after", metavar="HHMM", help="Show trains departing after this time")
+    parser.add_argument("--arriveby", metavar="HHMM", help="Show trains arriving by this time")
 
     day_grp = parser.add_mutually_exclusive_group()
     day_grp.add_argument("--tomorrow", action="store_true")
@@ -866,10 +887,24 @@ examples:
     else:
         target_date = today
 
+    # ── Resolve arriveby datetime (if set) ──
+    arriveby_dt: datetime | None = None
+    if args.arriveby:
+        h, m = parse_hhmm(args.arriveby)
+        arriveby_dt = datetime(target_date.year, target_date.month, target_date.day, h, m)
+
     # ── Resolve timeFrom ──
     if args.after:
         h, m = parse_hhmm(args.after)
         time_from = f"{target_date}T{h:02d}:{m:02d}:00"
+    elif arriveby_dt:
+        # Routes need a wider window to catch all trains arriving before the cutoff.
+        # Direct searches use 4h; routes use 6h to allow for the full journey time.
+        lookback = timedelta(hours=6) if is_route else timedelta(hours=4)
+        window_start = arriveby_dt - lookback
+        if target_date == today:
+            window_start = max(window_start, datetime.now())
+        time_from = window_start.strftime("%Y-%m-%dT%H:%M:%S")
     elif target_date == today:
         now = datetime.now()
         time_from = f"{target_date}T{now.hour:02d}:{now.minute:02d}:00"
@@ -879,7 +914,8 @@ examples:
 
     # ── Route or direct search ──
     if is_route:
-        display_route(saved_routes[args.from_station], args.from_station, time_from, detail=args.detail)
+        display_route(saved_routes[args.from_station], args.from_station, time_from,
+                      detail=args.detail, arriveby_dt=arriveby_dt)
         return
 
     data = api_search(args.from_station, args.to_station, time_from)
@@ -890,7 +926,25 @@ examples:
 
     raw_services = data.get("services") or []
     arrivals = resolve_arrivals(raw_services, args.to_station)
-    services = display_departures(data, args.from_station, args.to_station, arrivals)
+
+    # ── Filter by arriveby ──
+    arriveby_label: str | None = None
+    if arriveby_dt:
+        arriveby_label = arriveby_dt.strftime("%H:%M")
+        filtered: list[tuple] = []
+        first_after = False
+        for svc, arr in zip(raw_services, arrivals):
+            if arr is None or arr <= arriveby_dt:
+                filtered.append((svc, arr))
+            elif not first_after:
+                filtered.append((svc, arr))
+                first_after = True
+        raw_services = [s for s, _ in filtered]
+        arrivals     = [a for _, a in filtered]
+        data = {**data, "services": raw_services}
+
+    services = display_departures(data, args.from_station, args.to_station, arrivals,
+                                  arriveby_label=arriveby_label)
 
     # ── Detail view ──
     if args.detail is not None:
