@@ -464,8 +464,15 @@ def display_service_detail(data: dict, highlight_crs: str | None = None) -> None
         reasons = loc.get("reasons") or []
         assocs = loc.get("associatedServices") or []
 
-        # Skip pure passes (no passenger stop)
-        if display_as == "PASS" or display_as is None:
+        # Skip pure passes. When displayAs is null fall back to scheduledCallType
+        # (far-future services often have null displayAs but a valid scheduledCallType)
+        scheduled_call_type = temporal.get("scheduledCallType")
+        is_advertised_call = scheduled_call_type in (
+            "ADVERTISED_OPEN", "ADVERTISED_SET_DOWN", "ADVERTISED_PICK_UP"
+        )
+        if display_as == "PASS":
+            continue
+        if display_as is None and not is_advertised_call:
             continue
 
         name = location.get("description", "-")
@@ -543,7 +550,7 @@ _DEP_STYLES: dict[str, str] = {
 }
 
 
-def display_route(route: dict, route_name: str, time_from: str) -> None:
+def display_route(route: dict, route_name: str, time_from: str, detail: int | None = None) -> None:
     legs = route["legs"]
     transfer_mins = route.get("transfer", 25)
     leg1_from, leg1_to = legs[0]
@@ -573,8 +580,8 @@ def display_route(route: dict, route_name: str, time_from: str) -> None:
         # Try terminus shortcut first (avoids an API call when leg1_to is the train's terminus)
         arr = get_terminus_arrival(svc, leg1_to)
         if arr is None:
-            detail = api_service(identity, dep_date)
-            arr = find_arrival_at(detail, leg1_to)
+            svc_detail = api_service(identity, dep_date)
+            arr = find_arrival_at(svc_detail, leg1_to)
         if arr is None:
             continue
 
@@ -677,6 +684,27 @@ def display_route(route: dict, route_name: str, time_from: str) -> None:
         f"[dim]  Transfer: {transfer_mins} min at {leg1_to_name}  ·  "
         f"Use  rtt {leg1_from} {leg1_to}  or  rtt {leg2_from} {leg2_to}  for individual legs[/dim]"
     )
+
+    # ── Optional detail view for a specific connection ──
+    if detail is not None:
+        idx = detail - 1
+        if idx < 0 or idx >= len(connections):
+            console.print(f"[red]No connection #{detail} (found {len(connections)})[/red]")
+            return
+        conn = connections[idx]
+        s1 = conn["leg1_svc"]
+        s2 = conn.get("leg2_svc")
+
+        m1 = s1.get("scheduleMetadata", {})
+        console.print(f"\n[dim]Leg 1 detail: {m1.get('identity')} on {m1.get('departureDate')}…[/dim]")
+        display_service_detail(api_service(m1["identity"], m1["departureDate"]), highlight_crs=leg1_to)
+
+        if s2:
+            m2 = s2.get("scheduleMetadata", {})
+            console.print(f"\n[dim]Leg 2 detail: {m2.get('identity')} on {m2.get('departureDate')}…[/dim]")
+            display_service_detail(api_service(m2["identity"], m2["departureDate"]), highlight_crs=leg2_to)
+        else:
+            console.print("[yellow]No leg 2 service to show detail for.[/yellow]")
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
@@ -790,7 +818,7 @@ examples:
 
     # ── Route or direct search ──
     if is_route:
-        display_route(saved_routes[args.from_station], args.from_station, time_from)
+        display_route(saved_routes[args.from_station], args.from_station, time_from, detail=args.detail)
         return
 
     data = api_search(args.from_station, args.to_station, time_from)
