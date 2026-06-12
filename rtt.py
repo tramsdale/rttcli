@@ -229,12 +229,12 @@ def _headers() -> dict:
     return {"Authorization": f"Bearer {get_access_token()}"}
 
 
-def api_search(from_crs: str, to_crs: str, time_from: str) -> dict | None:
+def api_search(from_crs: str, to_crs: str, time_from: str, time_window: int = 240) -> dict | None:
     params = {
         "code": from_crs.upper(),
         "filterTo": to_crs.upper(),
         "timeFrom": time_from,
-        "timeWindow": 240,  # show next 4 hours of departures
+        "timeWindow": time_window,
     }
     r = requests.get(f"{BASE_URL}/gb-nr/location", headers=_headers(), params=params, timeout=10)
     if r.status_code == 204:
@@ -611,8 +611,15 @@ def display_route(route: dict, route_name: str, time_from: str, detail: int | No
     earliest_leg2_dt = min(c["leg1_arr"] for c in connections)
     leg2_time_from   = earliest_leg2_dt.strftime("%Y-%m-%dT%H:%M:%S")
 
+    # When filtering by arriveby, extend the window to cover arriveby + 2h so that
+    # connections just beyond the cutoff (shown as context) are fully resolved.
+    if arriveby_dt:
+        leg2_window = max(240, int((arriveby_dt - earliest_leg2_dt).total_seconds() // 60) + 120)
+    else:
+        leg2_window = 240
+
     console.print(f"[dim]Searching {leg2_from}→{leg2_to} from {earliest_leg2_dt.strftime('%H:%M')}…[/dim]")
-    leg2_data = api_search(leg2_from, leg2_to, leg2_time_from)
+    leg2_data = api_search(leg2_from, leg2_to, leg2_time_from, time_window=leg2_window)
     leg2_services = (leg2_data.get("services") or []) if leg2_data else []
 
     q2 = (leg2_data or {}).get("query", {})
@@ -643,16 +650,17 @@ def display_route(route: dict, route_name: str, time_from: str, detail: int | No
         conn["leg2_arr"] = arr2
 
     # ── Filter by arriveby (final leg 2 arrival) ──
+    # Keep all trains arriving by the cutoff, plus 2 after for context.
     if arriveby_dt:
         filtered_conns = []
-        first_after = False
+        after_count = 0
         for conn in connections:
             arr2 = conn.get("leg2_arr")
-            if arr2 is None or arr2 <= arriveby_dt:
+            if arr2 is not None and arr2 <= arriveby_dt:
                 filtered_conns.append(conn)
-            elif not first_after:
+            elif after_count < 2:
                 filtered_conns.append(conn)
-                first_after = True
+                after_count += 1
         connections = filtered_conns
 
     # ── Header ──
