@@ -1,22 +1,33 @@
 {
-    "dev": {
+    "production": {
         "app_function": "server.app.app",
         "aws_region": "eu-west-2",
         "profile_name": "default",
         "project_name": "rtt",
         "runtime": "python3.12",
-        "s3_bucket": "rtt-zappa-deployments",
+        "s3_bucket": "tripinfo-zappa-deployments",
         "cors": true,
+        "timeout_seconds": 30,
+        "memory_size": 256,
+        "keep_warm": false,
+        "domain": "rtt.tcla.me",
+        "certificate_arn": "arn:aws:acm:eu-west-2:758655430746:certificate/5dc5d804-018b-4d5c-ad46-4411be0f87a6",
         "environment_variables": {
             "RTT_TOKEN": "YOUR_RTT_TOKEN_HERE"
         },
         "exclude": [
-            "*.pyc",
+            "*.git*",
             "__pycache__",
-            ".git",
-            ".github",
+            "*.pyc",
             "test_rtt.py",
-            "*.md"
+            ".venv*",
+            "node_modules"
         ]
+    },
+    "dev": {
+        "extends": "production",
+        "domain": "rtt-dev.tcla.me",
+        "timeout_seconds": 120,
+        "memory_size": 256
     }
 }
