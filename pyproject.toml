@@ -6,3 +6,4 @@ dependencies = ["requests", "rich"]
 
 [dependency-groups]
 dev = ["pytest", "pytest-mock"]
+server = ["flask>=3.1", "zappa>=0.59"]

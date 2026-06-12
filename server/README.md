@@ -14,14 +14,19 @@ Flask app exposing the RTT CLI as an MCP server (for Claude) and a REST API (for
 
 ## Local development
 
+Server dependencies live in the `server` group in `pyproject.toml`. Create a dedicated virtualenv with uv:
+
 ```bash
 cd /path/to/rttcli
-python -m venv .venv-server
-source .venv-server/bin/activate
-pip install -r server/requirements.txt
+uv venv .venv-server --python 3.12
+uv pip install --python .venv-server flask zappa requests rich
+```
 
+Then run the dev server:
+
+```bash
 export RTT_TOKEN=your_token_here
-python server/app.py
+uv run --python .venv-server server/app.py
 ```
 
 The server runs on `http://localhost:5000`. Test it:
@@ -36,17 +41,17 @@ curl "http://localhost:5000/api/route?from1=BRI&to1=PAD&from2=KGX&to2=CMB"
 ### Prerequisites
 
 - AWS CLI configured (`aws configure`) with permissions to create Lambda functions, API Gateway, and S3 buckets
-- An S3 bucket in `eu-west-2` to store deployment packages (or update `s3_bucket` in `zappa_settings.json`)
+- uv and the `.venv-server` virtualenv set up as above
 
 ### First deploy
 
 ```bash
-# From the repo root
+# From the repo root — Zappa must run inside the activated venv
 source .venv-server/bin/activate
 
-# Edit zappa_settings.json — set your RTT_TOKEN and s3_bucket
+# Edit zappa_settings.json — set RTT_TOKEN to your real token
 # Then deploy:
-zappa deploy dev
+zappa deploy production
 ```
 
 Zappa will print an API Gateway URL like:
@@ -57,19 +62,20 @@ https://abc123xyz.execute-api.eu-west-2.amazonaws.com/dev
 ### Update after code changes
 
 ```bash
-zappa update dev
+source .venv-server/bin/activate
+zappa update production
 ```
 
 ### View logs
 
 ```bash
-zappa tail dev
+zappa tail production
 ```
 
 ### Tear down
 
 ```bash
-zappa undeploy dev
+zappa undeploy production
 ```
 
 ## After deploying
