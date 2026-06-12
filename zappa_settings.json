@@ -1,0 +1,22 @@
+{
+    "dev": {
+        "app_function": "server.app.app",
+        "aws_region": "eu-west-2",
+        "profile_name": "default",
+        "project_name": "rtt",
+        "runtime": "python3.12",
+        "s3_bucket": "rtt-zappa-deployments",
+        "cors": true,
+        "environment_variables": {
+            "RTT_TOKEN": "YOUR_RTT_TOKEN_HERE"
+        },
+        "exclude": [
+            "*.pyc",
+            "__pycache__",
+            ".git",
+            ".github",
+            "test_rtt.py",
+            "*.md"
+        ]
+    }
+}
