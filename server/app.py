@@ -48,7 +48,8 @@ def _get_access_token_env() -> str:
         headers={"Authorization": f"Bearer {refresh}"},
         timeout=10,
     )
-    r.raise_for_status()
+    if not r.ok:
+        raise RuntimeError(f"Token exchange failed ({r.status_code}): {r.text[:200]}")
     data = r.json()
     _token_cache["access_token"] = data["token"]
     _token_cache["valid_until"] = data.get("validUntil", "")
@@ -404,10 +405,12 @@ def rest_trains():
                                       request.args.get("date"),
                                       request.args.get("after"),
                                       request.args.get("arriveby")))
-    except (ValueError, RuntimeError) as e:
+    except ValueError as e:
         return jsonify({"error": str(e)}), 400
-    except SystemExit:
-        return jsonify({"error": "RTT API error"}), 502
+    except (RuntimeError, SystemExit) as e:
+        return jsonify({"error": str(e)}), 502
+    except Exception as e:
+        return jsonify({"error": f"Unexpected error: {type(e).__name__}: {e}"}), 500
 
 
 @app.route("/api/service")
@@ -420,10 +423,12 @@ def rest_service():
         return jsonify(_get_service(identity, dep_date,
                                     from_crs=request.args.get("from"),
                                     to_crs=request.args.get("to")))
-    except (ValueError, RuntimeError) as e:
+    except ValueError as e:
         return jsonify({"error": str(e)}), 400
-    except SystemExit:
-        return jsonify({"error": "RTT API error"}), 502
+    except (RuntimeError, SystemExit) as e:
+        return jsonify({"error": str(e)}), 502
+    except Exception as e:
+        return jsonify({"error": f"Unexpected error: {type(e).__name__}: {e}"}), 500
 
 
 @app.route("/api/route")
@@ -440,10 +445,12 @@ def rest_route():
                                      request.args.get("date"),
                                      request.args.get("after"),
                                      request.args.get("arriveby")))
-    except (ValueError, RuntimeError) as e:
+    except ValueError as e:
         return jsonify({"error": str(e)}), 400
-    except SystemExit:
-        return jsonify({"error": "RTT API error"}), 502
+    except (RuntimeError, SystemExit) as e:
+        return jsonify({"error": str(e)}), 502
+    except Exception as e:
+        return jsonify({"error": f"Unexpected error: {type(e).__name__}: {e}"}), 500
 
 
 # ── MCP endpoint (Streamable HTTP, protocol version 2024-11-05) ────────────────
@@ -509,6 +516,12 @@ _MCP_TOOLS = [
 ]
 
 
+@app.route("/mcp", methods=["GET"])
+def mcp_get():
+    # Some MCP clients probe with GET before sending POST requests.
+    return jsonify({"name": "rtt", "version": "0.1.0", "protocol": "mcp"}), 200
+
+
 @app.route("/mcp", methods=["POST"])
 def mcp():
     body   = request.get_json(force=True) or {}
@@ -553,10 +566,8 @@ def mcp():
                 return err(-32601, f"Unknown tool: {name!r}")
         except KeyError as e:
             return err(-32602, f"Missing required argument: {e}")
-        except (ValueError, RuntimeError) as e:
-            return err(-32603, f"Tool error: {e}")
-        except SystemExit as e:
-            return err(-32603, f"RTT API error: {e}")
+        except Exception as e:
+            return err(-32603, f"{type(e).__name__}: {e}")
 
         return ok({"content": [{"type": "text", "text": json.dumps(result, indent=2, default=str)}]})
 
