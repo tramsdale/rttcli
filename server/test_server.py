@@ -20,6 +20,7 @@ Usage:
 import argparse
 import json
 import sys
+import time
 from datetime import date, timedelta
 
 import requests
@@ -65,7 +66,10 @@ def check(label: str, passed: bool, detail: str = "") -> None:
         console.print(f"    [dim]{detail}[/dim]")
 
 
-def section(title: str) -> None:
+def section(title: str, pause: float = 15.0) -> None:
+    if pause:
+        console.print(f"  [dim]waiting {pause:.0f}s (rate limit)…[/dim]")
+        time.sleep(pause)
     console.print(f"\n[bold blue]{title}[/bold blue]")
 
 
@@ -79,7 +83,7 @@ def dump(data: dict) -> None:
 # ── Test suites ────────────────────────────────────────────────────────────────
 
 def test_mcp_protocol(base_url: str) -> None:
-    section("MCP protocol")
+    section("MCP protocol", pause=0)
 
     # GET probe
     try:
@@ -156,7 +160,7 @@ def test_search_trains(base_url: str) -> None:
     except Exception as e:
         check("search_trains arriveby", False, str(e))
 
-    # Missing required arg
+    # Missing required arg (no RTT API call — no sleep needed)
     try:
         resp = mcp_call(base_url, "tools/call", {
             "name": "search_trains",
@@ -194,7 +198,8 @@ def test_get_service_detail(base_url: str) -> None:
             "arguments": {"identity": identity, "departure_date": dep_date,
                           "from_crs": "PAD", "to_crs": "BRI"},
         })
-        check("no error field", "error" not in resp)
+        err_msg = (resp.get("error") or {}).get("message", "")
+        check("no error field", "error" not in resp, err_msg)
         content = resp.get("result", {}).get("content", [{}])[0].get("text", "{}")
         data = json.loads(content)
         check("has calling_points",      isinstance(data.get("calling_points"), list))
@@ -226,7 +231,8 @@ def test_search_route(base_url: str) -> None:
                 "transfer_mins": 25, "date": tomorrow,
             },
         })
-        check("no error field", "error" not in resp)
+        err_msg = (resp.get("error") or {}).get("message", "")
+        check("no error field", "error" not in resp, err_msg)
         content = resp.get("result", {}).get("content", [{}])[0].get("text", "{}")
         data = json.loads(content)
         check("has connections list",      isinstance(data.get("connections"), list))
@@ -241,6 +247,7 @@ def test_search_route(base_url: str) -> None:
         check("search_route BRI→PAD→KGX→CBG", False, str(e))
 
     # arriveby
+    section("search_route tool — arriveby")
     try:
         resp = mcp_call(base_url, "tools/call", {
             "name": "search_route",
@@ -260,8 +267,52 @@ def test_search_route(base_url: str) -> None:
         check("search_route arriveby", False, str(e))
 
 
-def test_rest_endpoints(base_url: str) -> None:
-    section("REST endpoints")
+def test_passing_points(base_url: str) -> None:
+    section("get_service_detail — passing points")
+    today = str(date.today())
+
+    # Re-fetch a service identity
+    try:
+        resp = mcp_call(base_url, "tools/call", {
+            "name": "search_trains",
+            "arguments": {"from_crs": "PAD", "to_crs": "BRI", "date": today},
+        })
+        trains = json.loads(
+            resp.get("result", {}).get("content", [{}])[0].get("text", "{}")
+        ).get("trains", [])
+        if not trains:
+            check("passing points (no trains to test with)", False)
+            return
+        identity = trains[0]["identity"]
+        dep_date = trains[0]["departure_date"]
+    except Exception as e:
+        check("setup: fetch identity for passing test", False, str(e))
+        return
+
+    try:
+        resp = mcp_call(base_url, "tools/call", {
+            "name": "get_service_detail",
+            "arguments": {"identity": identity, "departure_date": dep_date,
+                          "include_passing": True},
+        })
+        err_msg = (resp.get("error") or {}).get("message", "")
+        check("no error with include_passing=true", "error" not in resp, err_msg)
+        cps = json.loads(
+            resp.get("result", {}).get("content", [{}])[0].get("text", "{}")
+        ).get("calling_points", [])
+        passes = [cp for cp in cps if cp.get("status") == "PASS"]
+        check("passing points returned", len(passes) > 0,
+              f"got {len(passes)} PASS entries out of {len(cps)} total")
+        if passes:
+            timed = [p for p in passes if p.get("departs") or p.get("arrives")]
+            check("passing points have timing", len(timed) > 0,
+                  f"{len(timed)}/{len(passes)} passes have timing — additional detail {'enabled' if timed else 'NOT enabled'}")
+    except Exception as e:
+        check("get_service_detail with include_passing", False, str(e))
+
+
+def test_rest_endpoints(base_url: str, pause: float = 15.0) -> None:
+    section("REST endpoints", pause=pause)
     today = str(date.today())
 
     for path, params, label in [
@@ -298,6 +349,7 @@ def main() -> None:
     grp.add_argument("--local", action="store_true", help=f"Test local server ({LOCAL_URL})")
     grp.add_argument("--url",   metavar="URL",        help="Custom base URL")
     parser.add_argument("--dump", action="store_true", help="Dump full response for first search_trains call")
+    parser.add_argument("--dump-service", action="store_true", help="Dump raw service detail (all locations incl. PASS) for first PAD→BRI train")
     args = parser.parse_args()
 
     base_url = LOCAL_URL if args.local else (args.url or DEFAULT_URL)
@@ -305,7 +357,7 @@ def main() -> None:
     console.print(f"\n[bold]RTT server tests[/bold]  [dim]{base_url}[/dim]\n")
 
     if args.dump:
-        section("Raw search_trains response (PAD→BRI today)")
+        section("Raw search_trains response (PAD→BRI today)", pause=0)
         try:
             resp = mcp_call(base_url, "tools/call", {
                 "name": "search_trains",
@@ -315,11 +367,46 @@ def main() -> None:
         except Exception as e:
             console.print(f"[red]{e}[/red]")
 
+    if args.dump_service:
+        section("Raw service detail (PAD→BRI, include_passing=true)", pause=0)
+        try:
+            # Get an identity first
+            trains_resp = mcp_call(base_url, "tools/call", {
+                "name": "search_trains",
+                "arguments": {"from_crs": "PAD", "to_crs": "BRI"},
+            })
+            trains = json.loads(
+                trains_resp.get("result", {}).get("content", [{}])[0].get("text", "{}")
+            ).get("trains", [])
+            if trains:
+                identity = trains[0]["identity"]
+                dep_date = trains[0]["departure_date"]
+                console.print(f"[dim]Service {identity} on {dep_date}[/dim]")
+                # Call REST /api/service directly so we get the full raw dict
+                svc_resp = rest_get(base_url, "/api/service",
+                                    identity=identity, date=dep_date, passing="true")
+                cps = svc_resp.get("calling_points", [])
+                passes = [cp for cp in cps if cp.get("status") == "PASS"]
+                console.print(f"[bold]{len(cps)} total calling points, {len(passes)} PASS entries[/bold]")
+                if passes:
+                    console.print("\n[bold]PASS entries:[/bold]")
+                    for p in passes:
+                        console.print(f"  {p}")
+                else:
+                    console.print("[yellow]No PASS entries in response — additional detail may not be active, or this service has no passing points.[/yellow]")
+                    console.print("\n[dim]All calling points:[/dim]")
+                    for cp in cps:
+                        console.print(f"  {cp}")
+        except Exception as e:
+            console.print(f"[red]{e}[/red]")
+        sys.exit(0)
+
     test_mcp_protocol(base_url)
     test_search_trains(base_url)
     test_get_service_detail(base_url)
     test_search_route(base_url)
-    test_rest_endpoints(base_url)
+    test_passing_points(base_url)
+    test_rest_endpoints(base_url, pause=30)
 
     total = _passed + _failed
     colour = "green" if _failed == 0 else "red"

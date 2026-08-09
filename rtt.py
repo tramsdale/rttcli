@@ -11,6 +11,7 @@ import argparse
 import json
 import shutil
 import sys
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -248,13 +249,30 @@ def api_search(from_crs: str, to_crs: str, time_from: str, time_window: int = 24
     return r.json()
 
 
-def api_service(identity: str, dep_date: str) -> dict:
+_svc_cache: dict = {}
+_SVC_CACHE_TTL = 90  # seconds — short enough for realtime data to stay fresh
+
+
+def api_service(identity: str, dep_date: str, detailed: bool = False) -> dict:
+    key = (identity, dep_date, detailed)
+    entry = _svc_cache.get(key)
+    if entry:
+        result, expires = entry
+        if time.monotonic() < expires:
+            return result
+
     params = {"identity": identity, "departureDate": dep_date}
+    if detailed:
+        params["detailed"] = "true"
     r = requests.get(f"{BASE_URL}/gb-nr/service", headers=_headers(), params=params, timeout=10)
     if not r.ok:
         console.print(f"[red]API error {r.status_code}:[/red] {r.text[:200]}")
         sys.exit(1)
-    return r.json()
+    result = r.json()
+    if len(_svc_cache) >= 100:
+        _svc_cache.clear()
+    _svc_cache[key] = (result, time.monotonic() + _SVC_CACHE_TTL)
+    return result
 
 
 # ── Time display logic ────────────────────────────────────────────────────────
@@ -413,7 +431,8 @@ def display_departures(data: dict, from_crs: str, to_crs: str,
 
 # ── Display: service detail ───────────────────────────────────────────────────
 
-def display_service_detail(data: dict, highlight_crs: str | None = None, board_crs: str | None = None) -> None:
+def display_service_detail(data: dict, highlight_crs: str | None = None, board_crs: str | None = None,
+                           show_passing: bool = False) -> None:
     # Top-level response wraps everything inside a 'service' key
     svc_data = data.get("service", data)
     sched_meta = svc_data.get("scheduleMetadata", {})
@@ -467,15 +486,17 @@ def display_service_detail(data: dict, highlight_crs: str | None = None, board_c
         reasons = loc.get("reasons") or []
         assocs = loc.get("associatedServices") or []
 
-        # Skip pure passes. When displayAs is null fall back to scheduledCallType
+        # Skip pure passes unless --passing requested.
+        # When displayAs is null fall back to scheduledCallType
         # (far-future services often have null displayAs but a valid scheduledCallType)
         scheduled_call_type = temporal.get("scheduledCallType")
         is_advertised_call = scheduled_call_type in (
             "ADVERTISED_OPEN", "ADVERTISED_SET_DOWN", "ADVERTISED_PICK_UP"
         )
-        if display_as == "PASS":
+        is_pass = display_as == "PASS"
+        if is_pass and not show_passing:
             continue
-        if display_as is None and not is_advertised_call:
+        if display_as is None and not is_advertised_call and not is_pass:
             continue
 
         name = location.get("description", "-")
@@ -498,11 +519,15 @@ def display_service_detail(data: dict, highlight_crs: str | None = None, board_c
             platform = plat_plan
             plat_style = ""
 
-        arr_timing = temporal.get("arrival") or {}
-        dep_timing = temporal.get("departure") or {}
-
-        arr_text = _rich_time(arr_timing)
-        dep_text = _rich_time(dep_timing)
+        if is_pass:
+            pass_timing = temporal.get("pass") or {}
+            arr_text = Text("-", style="dim")
+            dep_text = _rich_time(pass_timing)
+        else:
+            arr_timing = temporal.get("arrival") or {}
+            dep_timing = temporal.get("departure") or {}
+            arr_text = _rich_time(arr_timing)
+            dep_text = _rich_time(dep_timing)
 
         badge = _status_badge(display_as, temporal, reasons)
 
@@ -529,6 +554,8 @@ def display_service_detail(data: dict, highlight_crs: str | None = None, board_c
             name_text = Text(name, style="magenta")
         elif display_as in ("STARTS", "TERMINATES"):
             name_text = Text(name, style="bold")
+        elif is_pass:
+            name_text = Text(f"  {name}", style="dim")
         elif is_board:
             name_text = Text(f"↑ {name}", style="bold green")
         elif is_highlight:
@@ -838,6 +865,8 @@ examples:
   rtt PAD BRI --friday                         next Friday's trains
   rtt PAD BRI --date 7/6/26                    specific date
   rtt PAD BRI --detail 1                       full calling points for first train
+  rtt BRI PAD KGX CBG                          inline two-leg route (no save needed)
+  rtt BRI PAD KGX CBG --tomorrow --after 0700  inline route with date/time options
   rtt rtn                                      run saved two-leg route
   rtt rtn --tomorrow --after 0700
 """,
@@ -845,6 +874,8 @@ examples:
 
     parser.add_argument("from_station", nargs="?", help="Origin CRS code (e.g. PAD)")
     parser.add_argument("to_station", nargs="?", help="Destination CRS code (e.g. BRI)")
+    parser.add_argument("via_station", nargs="?", help="Interchange station for 2-leg route (e.g. KGX)")
+    parser.add_argument("final_station", nargs="?", help="Final destination for 2-leg route (e.g. CBG)")
 
     parser.add_argument("--after", metavar="HHMM", help="Show trains departing after this time")
     parser.add_argument("--arriveby", metavar="HHMM", help="Show trains arriving by this time")
@@ -861,6 +892,8 @@ examples:
     day_grp.add_argument("--date", metavar="DD/MM/YY", help="Specific date")
 
     parser.add_argument("--detail", metavar="N", type=int, help="Show full calling points for train #N")
+    parser.add_argument("--passing", action="store_true", help="Include passing points in detail view (requires additional detail access)")
+    parser.add_argument("--debug-passing", action="store_true", help="Dump raw temporal data for PASS entries (diagnostic)")
 
     args = parser.parse_args()
 
@@ -868,7 +901,10 @@ examples:
     saved_routes = load_config().get("routes", {})
     is_route = bool(args.from_station and not args.to_station and args.from_station in saved_routes)
 
-    if not is_route and (not args.from_station or not args.to_station):
+    # Detect inline 2-leg route: `rtt FROM TO VIA DEST`
+    is_inline_route = bool(args.from_station and args.to_station and args.via_station and args.final_station)
+
+    if not is_route and not is_inline_route and (not args.from_station or not args.to_station):
         parser.print_help()
         sys.exit(1)
 
@@ -908,7 +944,7 @@ examples:
     elif arriveby_dt:
         # Routes need a wider window to catch all trains arriving before the cutoff.
         # Direct searches use 4h; routes use 6h to allow for the full journey time.
-        lookback = timedelta(hours=6) if is_route else timedelta(hours=4)
+        lookback = timedelta(hours=6) if (is_route or is_inline_route) else timedelta(hours=4)
         window_start = arriveby_dt - lookback
         if target_date == today:
             window_start = max(window_start, datetime.now())
@@ -921,6 +957,18 @@ examples:
         time_from = f"{target_date}T06:00:00"
 
     # ── Route or direct search ──
+    if is_inline_route:
+        inline_route = {
+            "legs": [
+                [args.from_station.upper(), args.to_station.upper()],
+                [args.via_station.upper(), args.final_station.upper()],
+            ],
+            "transfer": 25,
+        }
+        route_name = f"{args.from_station.upper()}→{args.to_station.upper()}+{args.via_station.upper()}→{args.final_station.upper()}"
+        display_route(inline_route, route_name, time_from, detail=args.detail, arriveby_dt=arriveby_dt)
+        return
+
     if is_route:
         display_route(saved_routes[args.from_station], args.from_station, time_from,
                       detail=args.detail, arriveby_dt=arriveby_dt)
@@ -971,8 +1019,19 @@ examples:
             sys.exit(1)
 
         console.print(f"\n[dim]Fetching detail for service {identity} on {dep_date}…[/dim]")
-        detail = api_service(identity, dep_date)
-        display_service_detail(detail, highlight_crs=args.to_station)
+        detail = api_service(identity, dep_date, detailed=args.passing)
+        if args.debug_passing:
+            svc = detail.get("service", detail)
+            passes = [loc for loc in (svc.get("locations") or [])
+                      if (loc.get("temporalData") or {}).get("displayAs") == "PASS"]
+            console.print(f"\n[bold]PASS entries ({len(passes)}) — raw temporal data:[/bold]")
+            for loc in passes[:5]:
+                name = (loc.get("location") or {}).get("description", "?")
+                td = loc.get("temporalData") or {}
+                console.print(f"  [bold]{name}[/bold]")
+                console.print(f"    {json.dumps(td, indent=4, default=str)[:500]}")
+            return
+        display_service_detail(detail, highlight_crs=args.to_station, show_passing=args.passing)
 
 
 if __name__ == "__main__":

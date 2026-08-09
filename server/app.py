@@ -162,8 +162,11 @@ def _search_trains(from_crs: str, to_crs: str, date_str: str | None,
 
     time_from = _build_time_from(target_date, after, arriveby_dt)
 
+    # 120-min window is enough for a typical departure board; arriveby queries use the
+    # full window so the lookback already constrains how far back we search.
+    window = 240 if arriveby_dt else 120
     try:
-        data = rtt.api_search(from_crs, to_crs, time_from)
+        data = rtt.api_search(from_crs, to_crs, time_from, time_window=window)
     except SystemExit as e:
         raise RuntimeError("RTT API error") from e
 
@@ -198,9 +201,10 @@ def _search_trains(from_crs: str, to_crs: str, date_str: str | None,
     }
 
 
-def _get_service(identity: str, dep_date: str, from_crs: str | None, to_crs: str | None) -> dict:
+def _get_service(identity: str, dep_date: str, from_crs: str | None, to_crs: str | None,
+                 include_passing: bool = False) -> dict:
     try:
-        data = rtt.api_service(identity, dep_date)
+        data = rtt.api_service(identity, dep_date, detailed=include_passing)
     except SystemExit as e:
         raise RuntimeError("RTT API error") from e
 
@@ -215,20 +219,28 @@ def _get_service(identity: str, dep_date: str, from_crs: str | None, to_crs: str
         display_as = temporal.get("displayAs")
         sct = temporal.get("scheduledCallType")
         is_advertised = sct in ("ADVERTISED_OPEN", "ADVERTISED_SET_DOWN", "ADVERTISED_PICK_UP")
-        if display_as == "PASS":
+        is_pass = display_as == "PASS"
+        if is_pass and not include_passing:
             continue
-        if display_as is None and not is_advertised:
+        if display_as is None and not is_advertised and not is_pass:
             continue
 
         location = loc.get("location", {})
         codes = location.get("shortCodes") or []
-        arr = temporal.get("arrival") or {}
-        dep = temporal.get("departure") or {}
 
         def _t(timing: dict) -> str | None:
             s = (timing.get("realtimeActual") or timing.get("realtimeForecast") or
-                 timing.get("scheduleAdvertised") or "")[11:16]
+                 timing.get("scheduleAdvertised") or timing.get("scheduleInternal") or "")[11:16]
             return s or None
+
+        if is_pass:
+            pass_timing = temporal.get("pass") or {}
+            arrives, departs = None, _t(pass_timing)
+            lateness = pass_timing.get("realtimeInternalLateness") or 0
+        else:
+            arrives  = _t(temporal.get("arrival")   or {})
+            departs  = _t(temporal.get("departure")  or {})
+            lateness = 0
 
         plat_obj = ((loc.get("locationMetadata") or {}).get("platform") or {})
         platform = plat_obj.get("actual") or plat_obj.get("forecast") or plat_obj.get("planned") or "-"
@@ -236,11 +248,13 @@ def _get_service(identity: str, dep_date: str, from_crs: str | None, to_crs: str
         point: dict = {
             "station":  location.get("description", "-"),
             "crs":      codes[0] if codes else "-",
-            "arrives":  _t(arr),
-            "departs":  _t(dep),
+            "arrives":  arrives,
+            "departs":  departs,
             "platform": platform,
             "status":   display_as or "CALL",
         }
+        if is_pass and lateness and lateness > 1:
+            point["lateness_mins"] = lateness
         if from_crs and any(c.upper() == from_crs.upper() for c in codes):
             point["note"] = "board here"
         if to_crs and any(c.upper() == to_crs.upper() for c in codes):
@@ -320,7 +334,12 @@ def _search_route(from1: str, to1: str, from2: str, to2: str, transfer_mins: int
     to2_name   = q2.get("filterTo", {}).get("description", to2.upper())
 
     for conn in connections:
+        # First leg-2 service after leg-1 arrives (may be too soon to catch)
+        candidate = rtt.find_next_service_after(leg2_svcs, conn["leg1_arr"])
+        # First leg-2 service catchable after the transfer window
         s2 = rtt.find_next_service_after(leg2_svcs, conn["leg2_earliest"])
+        # If there's a service between arrival and earliest-catchable, it's the one just missed
+        conn["missed_s2"] = candidate if (candidate and candidate is not s2) else None
         conn["leg2_svc"] = s2
         if s2 is None:
             conn["leg2_arr"] = None
@@ -361,6 +380,17 @@ def _search_route(from1: str, to1: str, from2: str, to2: str, transfer_mins: int
             "interchange_arrives": conn["leg1_arr"].strftime("%H:%M"),
         }
 
+        ms2 = conn.get("missed_s2")
+        if ms2:
+            dm  = (ms2.get("temporalData") or {}).get("departure") or {}
+            dep_missed = (dm.get("realtimeActual") or dm.get("realtimeForecast") or
+                          dm.get("scheduleAdvertised") or "")[11:16]
+            c["missed_leg2"] = {
+                "departs":  dep_missed,
+                "headcode": ms2.get("scheduleMetadata", {}).get("trainReportingIdentity", "-"),
+                "note":     "just missed — departs before transfer window",
+            }
+
         if s2:
             m2  = s2.get("scheduleMetadata", {})
             d2  = (s2.get("temporalData") or {}).get("departure") or {}
@@ -371,10 +401,10 @@ def _search_route(from1: str, to1: str, from2: str, to2: str, transfer_mins: int
             total = int((dep2_dt - conn["leg1_arr"]).total_seconds() // 60) if dep2_dt else None
             margin = (total - transfer_mins) if total is not None else None
             c.update({
-                "leg2_departs":       dep2,
-                "leg2_headcode":      m2.get("trainReportingIdentity", "-"),
-                "final_arrives":      conn["leg2_arr"].strftime("%H:%M") if conn.get("leg2_arr") else None,
-                "margin_mins":        margin,
+                "leg2_departs":        dep2,
+                "leg2_headcode":       m2.get("trainReportingIdentity", "-"),
+                "final_arrives":       conn["leg2_arr"].strftime("%H:%M") if conn.get("leg2_arr") else None,
+                "margin_mins":         margin,
                 "total_transfer_mins": total,
                 "status": (s2.get("temporalData") or {}).get("displayAs", "SCHEDULED"),
             })
@@ -420,9 +450,11 @@ def rest_service():
         dep_date = request.args.get("date", "").strip()
         if not identity or not dep_date:
             return jsonify({"error": "identity and date query parameters are required"}), 400
+        include_passing = request.args.get("passing", "false").lower() == "true"
         return jsonify(_get_service(identity, dep_date,
                                     from_crs=request.args.get("from"),
-                                    to_crs=request.args.get("to")))
+                                    to_crs=request.args.get("to"),
+                                    include_passing=include_passing))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except (RuntimeError, SystemExit) as e:
@@ -459,8 +491,11 @@ _MCP_TOOLS = [
     {
         "name": "search_trains",
         "description": (
-            "Search for UK train services between two stations. Returns departure times, "
-            "arrival times at the destination, headcodes, platforms, operators, and live status."
+            "Search for UK train services between two stations on a SINGLE rail leg. "
+            "Returns departure times, arrival times, headcodes, platforms, operators, and live status. "
+            "IMPORTANT: do NOT use this for journeys that cross London between different terminals "
+            "(e.g. Bristol→Cambridge, Exeter→Norwich, Cardiff→Leeds). "
+            "For those, use search_route instead — it handles the cross-London transfer automatically."
         ),
         "inputSchema": {
             "type": "object",
@@ -479,15 +514,21 @@ _MCP_TOOLS = [
         "description": (
             "Get all calling points for a specific train service, including scheduled and actual "
             "arrival/departure times, platforms, and delay reasons. Use the identity and "
-            "departure_date from a search_trains result."
+            "departure_date from a search_trains result. "
+            "By default only scheduled stops are returned. Set include_passing=true to also "
+            "return every intermediate location the train passes through without stopping — "
+            "this gives a complete picture of the train's path and current position. "
+            "Always set include_passing=true when the user asks about passing points, "
+            "intermediate stations, or where the train currently is between stops."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "identity":       {"type": "string", "description": "Service identity (e.g. W34739)"},
-                "departure_date": {"type": "string", "description": "Date YYYY-MM-DD"},
-                "from_crs":       {"type": "string", "description": "Boarding station CRS (optional)"},
-                "to_crs":         {"type": "string", "description": "Alighting station CRS (optional)"},
+                "identity":        {"type": "string",  "description": "Service identity (e.g. W34739)"},
+                "departure_date":  {"type": "string",  "description": "Date YYYY-MM-DD"},
+                "from_crs":        {"type": "string",  "description": "Boarding station CRS (optional)"},
+                "to_crs":          {"type": "string",  "description": "Alighting station CRS (optional)"},
+                "include_passing": {"type": "boolean", "description": "Set to true to include intermediate passing points (non-stopping locations). Required for complete train path detail."},
             },
             "required": ["identity", "departure_date"],
         },
@@ -495,20 +536,46 @@ _MCP_TOOLS = [
     {
         "name": "search_route",
         "description": (
-            "Find connections for a two-leg journey with an interchange (e.g. train then tube). "
-            "Returns matched connections with transfer margins and final arrival times."
+            "Find connections for a two-leg rail journey with an interchange. "
+            "Use this whenever a journey requires changing between London terminals or any other "
+            "station-to-station transfer that is not itself a train (e.g. Tube, walking, bus). "
+            "The tool searches leg 1 trains, resolves arrivals at the interchange, then finds "
+            "the first viable leg 2 train after the transfer window. "
+            "transfer_mins defaults to 25 and should be kept at 25 unless you have a specific reason. "
+            "\n\n"
+            "CROSS-LONDON ROUTING — use this tool whenever a journey passes through London "
+            "and the two rail legs use different terminals. The transfer leg (Tube etc.) is "
+            "not searched; transfer_mins covers it. Default transfer times between London terminals:\n"
+            "  PAD  → KGX/STP : 25 min (Circle/H&C line or Tube)\n"
+            "  PAD  → EUS      : 25 min (Circle/H&C line)\n"
+            "  PAD  → WAT      : 30 min (Bakerloo then walk, or bus)\n"
+            "  PAD  → VIC      : 25 min (Circle/District line)\n"
+            "  PAD  → LBG      : 30 min (Circle line)\n"
+            "  KGX  → STP      : 5  min (adjacent stations, short walk; use 10 to be safe)\n"
+            "  KGX  → EUS      : 10 min (short walk)\n"
+            "  VIC  → WAT      : 20 min (walk or bus)\n"
+            "  VIC  → LBG      : 15 min (Circle/District line)\n"
+            "  WAT  → LBG      : 15 min (Jubilee or walk)\n"
+            "\n"
+            "CRS codes for London terminals: "
+            "PAD=Paddington, KGX=King's Cross, STP=St Pancras International, "
+            "EUS=Euston, WAT=Waterloo, VIC=Victoria, LBG=London Bridge, "
+            "CST=Cannon Street, CHX=Charing Cross, MYB=Marylebone, FST=Fenchurch Street.\n"
+            "\n"
+            "Example: Bristol → Cambridge via cross-London: "
+            "from1=BRI, to1=PAD, from2=KGX, to2=CBG, transfer_mins=25"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "from1":          {"type": "string", "description": "Leg 1 origin CRS"},
-                "to1":            {"type": "string", "description": "Leg 1 destination / interchange CRS"},
-                "from2":          {"type": "string", "description": "Leg 2 origin CRS"},
-                "to2":            {"type": "string", "description": "Leg 2 destination CRS"},
-                "transfer_mins":  {"type": "integer", "description": "Minimum transfer time in minutes (default: 25)"},
-                "date":           {"type": "string", "description": "Date YYYY-MM-DD (default: today)"},
-                "after":          {"type": "string", "description": "After HHMM"},
-                "arriveby":       {"type": "string", "description": "Arriving at final destination by HHMM"},
+                "from1":          {"type": "string",  "description": "Leg 1 origin CRS"},
+                "to1":            {"type": "string",  "description": "Leg 1 destination / interchange CRS (the London terminal the train arrives at)"},
+                "from2":          {"type": "string",  "description": "Leg 2 origin CRS (the London terminal the onward train departs from)"},
+                "to2":            {"type": "string",  "description": "Leg 2 final destination CRS"},
+                "transfer_mins":  {"type": "integer", "description": "Transfer time between the two terminals in minutes (default 25; see description for cross-London defaults)"},
+                "date":           {"type": "string",  "description": "Date YYYY-MM-DD (default: today)"},
+                "after":          {"type": "string",  "description": "After HHMM"},
+                "arriveby":       {"type": "string",  "description": "Arriving at final destination by HHMM"},
             },
             "required": ["from1", "to1", "from2", "to2"],
         },
@@ -540,6 +607,31 @@ def mcp():
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "rtt", "version": "0.1.0"},
+            "instructions": (
+                "This server provides live UK train information via the Real Time Trains API.\n"
+                "\n"
+                "CRITICAL — CROSS-LONDON ROUTING:\n"
+                "Many UK journeys require crossing London between different terminals. "
+                "Whenever a journey passes through London AND the origin/destination are on different "
+                "sides of London (e.g. Bristol→Cambridge, Exeter→Norwich, Cardiff→Leeds, "
+                "Southampton→Edinburgh), you MUST use search_route, not search_trains. "
+                "search_route handles the cross-London transfer automatically using a transfer_mins "
+                "window (default 25 min). Never call search_trains twice and try to join them manually.\n"
+                "\n"
+                "Common cross-London terminal pairs and transfer times:\n"
+                "  PAD→KGX/STP: 25 min  |  PAD→EUS: 25 min  |  PAD→WAT: 30 min\n"
+                "  PAD→VIC: 25 min      |  PAD→LBG: 30 min  |  KGX↔STP: 10 min\n"
+                "  KGX↔EUS: 10 min      |  VIC↔WAT: 20 min  |  VIC↔LBG: 15 min\n"
+                "\n"
+                "London terminal CRS codes:\n"
+                "  PAD=Paddington, KGX=King's Cross, STP=St Pancras, EUS=Euston,\n"
+                "  WAT=Waterloo, VIC=Victoria, LBG=London Bridge, MYB=Marylebone,\n"
+                "  CHX=Charing Cross, CST=Cannon Street, FST=Fenchurch Street\n"
+                "\n"
+                "PASSING POINTS:\n"
+                "When asked where a train currently is, or for intermediate stations between stops, "
+                "always call get_service_detail with include_passing=true."
+            ),
         })
 
     if method in ("notifications/initialized",):
@@ -557,7 +649,8 @@ def mcp():
                                         args.get("date"), args.get("after"), args.get("arriveby"))
             elif name == "get_service_detail":
                 result = _get_service(args["identity"], args["departure_date"],
-                                      args.get("from_crs"), args.get("to_crs"))
+                                      args.get("from_crs"), args.get("to_crs"),
+                                      include_passing=bool(args.get("include_passing", False)))
             elif name == "search_route":
                 result = _search_route(args["from1"], args["to1"], args["from2"], args["to2"],
                                        int(args.get("transfer_mins", 25)),
@@ -580,14 +673,29 @@ _OPENAPI = {
     "openapi": "3.1.0",
     "info": {
         "title": "Real Time Trains",
-        "description": "Live UK train departure boards, service details, and multi-leg route connections.",
+        "description": (
+            "Live UK train departure boards, service details, and multi-leg route connections.\n\n"
+            "CROSS-LONDON ROUTING: Many UK journeys cross London between different terminals. "
+            "Whenever a journey passes through London and the two rail legs use different terminals "
+            "(e.g. Bristol→Cambridge, Exeter→Norwich, Cardiff→Leeds), use /api/route — NOT two "
+            "separate calls to /api/trains. /api/route handles the cross-London transfer automatically "
+            "via the transfer parameter (default 25 min). Never call /api/trains twice and join results manually.\n\n"
+            "Common cross-London pairs and transfer times (minutes): "
+            "PAD→KGX/STP 25, PAD→EUS 25, PAD→WAT 30, PAD→VIC 25, PAD→LBG 30, "
+            "KGX↔STP 10, KGX↔EUS 10, VIC↔WAT 20, VIC↔LBG 15.\n\n"
+            "London terminal CRS codes: PAD=Paddington, KGX=King's Cross, STP=St Pancras, "
+            "EUS=Euston, WAT=Waterloo, VIC=Victoria, LBG=London Bridge, MYB=Marylebone, "
+            "CHX=Charing Cross, CST=Cannon Street, FST=Fenchurch Street.\n\n"
+            "PASSING POINTS: To see intermediate stations a train passes through without stopping, "
+            "call /api/service with passing=true."
+        ),
         "version": "0.1.0",
     },
     "servers": [{"url": "https://YOUR_API_GATEWAY_URL"}],
     "paths": {
         "/api/trains": {"get": {
             "operationId": "searchTrains",
-            "summary": "Search for trains between two UK stations",
+            "summary": "Search for trains on a single rail leg (use searchRoute for cross-London journeys)",
             "parameters": [
                 {"name": "from",     "in": "query", "required": True,  "schema": {"type": "string"}, "description": "Origin CRS code (e.g. PAD)"},
                 {"name": "to",       "in": "query", "required": True,  "schema": {"type": "string"}, "description": "Destination CRS code"},
@@ -601,10 +709,11 @@ _OPENAPI = {
             "operationId": "getServiceDetail",
             "summary": "Get all calling points for a specific train service",
             "parameters": [
-                {"name": "identity", "in": "query", "required": True,  "schema": {"type": "string"}, "description": "Service identity from searchTrains"},
-                {"name": "date",     "in": "query", "required": True,  "schema": {"type": "string"}, "description": "Departure date YYYY-MM-DD"},
-                {"name": "from",     "in": "query", "required": False, "schema": {"type": "string"}, "description": "Boarding station CRS"},
-                {"name": "to",       "in": "query", "required": False, "schema": {"type": "string"}, "description": "Alighting station CRS"},
+                {"name": "identity", "in": "query", "required": True,  "schema": {"type": "string"},  "description": "Service identity from searchTrains"},
+                {"name": "date",     "in": "query", "required": True,  "schema": {"type": "string"},  "description": "Departure date YYYY-MM-DD"},
+                {"name": "from",     "in": "query", "required": False, "schema": {"type": "string"},  "description": "Boarding station CRS"},
+                {"name": "to",       "in": "query", "required": False, "schema": {"type": "string"},  "description": "Alighting station CRS"},
+                {"name": "passing",  "in": "query", "required": False, "schema": {"type": "boolean"}, "description": "Include intermediate passing points"},
             ],
             "responses": {"200": {"description": "Calling points"}},
         }},
