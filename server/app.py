@@ -149,6 +149,11 @@ def _svc_summary(svc: dict, arr: datetime | None, idx: int) -> dict:
         out["delay_reason"] = reasons[0].get("shortText", "")
     if arr:
         out["arrives"] = arr.strftime("%H:%M")
+    # Set only for a station-group search (e.g. from_crs/to_crs="LON") — the real
+    # station this particular train uses, since the group covers more than one.
+    station = svc.get("_grp_to") or svc.get("_grp_from")
+    if station:
+        out["station"] = station
     return out
 
 
@@ -169,21 +174,22 @@ def _search_trains(from_crs: str, to_crs: str, date_str: str | None,
     # full window so the lookback already constrains how far back we search.
     window = 240 if arriveby_dt else 120
     try:
-        data = rtt.api_search(from_crs, to_crs, time_from, time_window=window)
+        # api_search_grouped expands station-group codes like "LON" (KGX+STP) and merges
+        # the results; it behaves exactly like a single api_search call for a plain CRS.
+        raw, group_meta = rtt.api_search_grouped(from_crs, to_crs, time_from, time_window=window)
     except SystemExit as e:
         raise RuntimeError("RTT API error") from e
 
-    if not data:
-        return {"from": from_crs.upper(), "to": to_crs.upper(), "date": str(target_date), "trains": []}
-
-    query = data.get("query", {})
-    from_name = query.get("location", {}).get("description", from_crs.upper())
-    to_name   = query.get("filterTo", {}).get("description", to_crs.upper())
-    to_long_codes = query.get("filterTo", {}).get("longCodes") or []
-    raw = data.get("services") or []
+    if not raw:
+        return {
+            "from": f"{group_meta['from_label']} ({from_crs.upper()})",
+            "to":   f"{group_meta['to_label']} ({to_crs.upper()})",
+            "date": str(target_date),
+            "trains": [],
+        }
 
     try:
-        arrivals = rtt.resolve_arrivals(raw, to_crs, to_long_codes)
+        arrivals = rtt.resolve_arrivals_grouped(raw, to_crs, group_meta.get("to_long_codes"))
     except SystemExit:
         arrivals = [None] * len(raw)
 
@@ -198,8 +204,8 @@ def _search_trains(from_crs: str, to_crs: str, date_str: str | None,
         raw, arrivals = ([s for s, _ in pairs], [a for _, a in pairs]) if pairs else ([], [])
 
     return {
-        "from": f"{from_name} ({from_crs.upper()})",
-        "to":   f"{to_name} ({to_crs.upper()})",
+        "from": f"{group_meta['from_label']} ({from_crs.upper()})",
+        "to":   f"{group_meta['to_label']} ({to_crs.upper()})",
         "date": str(target_date),
         "trains": [_svc_summary(s, a, i + 1) for i, (s, a) in enumerate(zip(raw, arrivals))],
     }
@@ -773,13 +779,23 @@ _MCP_TOOLS = [
             "Returns departure times, arrival times, headcodes, platforms, operators, and live status. "
             "IMPORTANT: do NOT use this for journeys that cross London between different terminals "
             "(e.g. Bristol→Cambridge, Exeter→Norwich, Cardiff→Leeds). "
-            "For those, use search_route instead — it handles the cross-London transfer automatically."
+            "For those, use search_route instead — it handles the cross-London transfer automatically. "
+            "\n\n"
+            "STATION GROUPS: from_crs/to_crs also accepts 'LON', which searches King's Cross (KGX) "
+            "and St Pancras International (STP) together and merges the results — use this whenever "
+            "either terminal would work equally well for the traveller, instead of calling this tool "
+            "twice and merging manually. Each returned train includes a 'station' field naming the "
+            "real terminal it actually uses. Station groups are only supported here, not as a leg "
+            "in search_route. "
+            "\n\n"
+            "To let someone track a returned train live, build a share link from its identity and "
+            "departure_date: https://rtt.tcla.me/t/<identity>/<departure_date>?from=<from_crs>&to=<to_crs>"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "from_crs":  {"type": "string", "description": "Origin CRS code (e.g. PAD, BRI, KGX)"},
-                "to_crs":    {"type": "string", "description": "Destination CRS code"},
+                "from_crs":  {"type": "string", "description": "Origin CRS code (e.g. PAD, BRI, KGX), or 'LON' for King's Cross + St Pancras combined"},
+                "to_crs":    {"type": "string", "description": "Destination CRS code, or 'LON' for King's Cross + St Pancras combined"},
                 "date":      {"type": "string", "description": "Date YYYY-MM-DD (default: today)"},
                 "after":     {"type": "string", "description": "Show trains departing at or after HHMM (e.g. 0900)"},
                 "arriveby":  {"type": "string", "description": "Show trains arriving by HHMM"},
@@ -820,6 +836,8 @@ _MCP_TOOLS = [
             "The tool searches leg 1 trains, resolves arrivals at the interchange, then finds "
             "the first viable leg 2 train after the transfer window. "
             "transfer_mins defaults to 25 and should be kept at 25 unless you have a specific reason. "
+            "Station groups like 'LON' are NOT supported here — from1/to1/from2/to2 must be real "
+            "CRS codes (e.g. KGX or STP individually, not LON)."
             "\n\n"
             "CROSS-LONDON ROUTING — use this tool whenever a journey passes through London "
             "and the two rail legs use different terminals. The transfer leg (Tube etc.) is "
@@ -906,9 +924,24 @@ def mcp():
                 "  WAT=Waterloo, VIC=Victoria, LBG=London Bridge, MYB=Marylebone,\n"
                 "  CHX=Charing Cross, CST=Cannon Street, FST=Fenchurch Street\n"
                 "\n"
+                "STATION GROUPS:\n"
+                "search_trains accepts 'LON' as from_crs or to_crs to search King's Cross (KGX) and "
+                "St Pancras (STP) together and merge the results — use this instead of calling "
+                "search_trains twice for KGX and STP and merging manually. Not supported by "
+                "search_route's leg codes.\n"
+                "\n"
                 "PASSING POINTS:\n"
                 "When asked where a train currently is, or for intermediate stations between stops, "
-                "always call get_service_detail with include_passing=true."
+                "always call get_service_detail with include_passing=true.\n"
+                "\n"
+                "SHARING A LIVE TRACKING LINK:\n"
+                "If the user wants to track a train, follow it live, or share its status with someone "
+                "else (e.g. a parent watching a child's journey), offer this public, no-login link:\n"
+                "  https://rtt.tcla.me/t/<identity>/<departure_date>?from=<from_crs>&to=<to_crs>\n"
+                "<identity> and <departure_date> come from a search_trains result; from/to are optional "
+                "but highlight the boarding/alighting stop. The page shows live status and highlights "
+                "the next stop; auto-refresh is off by default (the visitor turns it on themselves), "
+                "so there's no need to mention that separately."
             ),
         })
 
@@ -964,8 +997,16 @@ _OPENAPI = {
             "London terminal CRS codes: PAD=Paddington, KGX=King's Cross, STP=St Pancras, "
             "EUS=Euston, WAT=Waterloo, VIC=Victoria, LBG=London Bridge, MYB=Marylebone, "
             "CHX=Charing Cross, CST=Cannon Street, FST=Fenchurch Street.\n\n"
+            "STATION GROUPS: /api/trains accepts 'LON' as from/to to search King's Cross (KGX) and "
+            "St Pancras (STP) together and merge the results — use this instead of calling /api/trains "
+            "twice for KGX and STP. Each returned train includes a 'station' field naming the real "
+            "terminal it uses. Not supported by /api/route's leg codes.\n\n"
             "PASSING POINTS: To see intermediate stations a train passes through without stopping, "
-            "call /api/service with passing=true."
+            "call /api/service with passing=true.\n\n"
+            "SHARING A LIVE TRACKING LINK: to let someone follow a train's live status (e.g. a parent "
+            "tracking a child's journey), offer this public, no-login link, built from a /api/trains "
+            "result's identity and departure_date: "
+            "https://rtt.tcla.me/t/{identity}/{departure_date}?from={from}&to={to}"
         ),
         "version": "0.1.0",
     },
@@ -975,8 +1016,8 @@ _OPENAPI = {
             "operationId": "searchTrains",
             "summary": "Search for trains on a single rail leg (use searchRoute for cross-London journeys)",
             "parameters": [
-                {"name": "from",     "in": "query", "required": True,  "schema": {"type": "string"}, "description": "Origin CRS code (e.g. PAD)"},
-                {"name": "to",       "in": "query", "required": True,  "schema": {"type": "string"}, "description": "Destination CRS code"},
+                {"name": "from",     "in": "query", "required": True,  "schema": {"type": "string"}, "description": "Origin CRS code (e.g. PAD), or 'LON' for King's Cross + St Pancras combined"},
+                {"name": "to",       "in": "query", "required": True,  "schema": {"type": "string"}, "description": "Destination CRS code, or 'LON' for King's Cross + St Pancras combined"},
                 {"name": "date",     "in": "query", "required": False, "schema": {"type": "string"}, "description": "Date YYYY-MM-DD"},
                 {"name": "after",    "in": "query", "required": False, "schema": {"type": "string"}, "description": "Departing after HHMM"},
                 {"name": "arriveby", "in": "query", "required": False, "schema": {"type": "string"}, "description": "Arriving by HHMM"},
@@ -997,7 +1038,7 @@ _OPENAPI = {
         }},
         "/api/route": {"get": {
             "operationId": "searchRoute",
-            "summary": "Find connections for a two-leg journey with an interchange",
+            "summary": "Find connections for a two-leg journey with an interchange (leg codes must be real CRS codes — station groups like LON are not supported here)",
             "parameters": [
                 {"name": "from1",    "in": "query", "required": True,  "schema": {"type": "string"}, "description": "Leg 1 origin CRS"},
                 {"name": "to1",      "in": "query", "required": True,  "schema": {"type": "string"}, "description": "Leg 1 destination / interchange CRS"},

@@ -341,6 +341,38 @@ def test_rest_endpoints(base_url: str, pause: float = 15.0) -> None:
         check("missing params → 400", False, str(e))
 
 
+def test_station_groups(base_url: str) -> None:
+    section("station groups (LON via REST + MCP)")
+
+    # REST: /api/trains?to=LON
+    try:
+        data = rest_get(base_url, "/api/trains", **{"from": "CBG", "to": "LON"})
+        trains = data.get("trains", [])
+        check("GET /api/trains?to=LON returns trains", len(trains) > 0, f"got {len(trains)} trains")
+        check("to label mentions both stations",
+              "Kings Cross" in data.get("to", "") and "Pancras" in data.get("to", ""),
+              f"to={data.get('to')!r}")
+        stations = {t.get("station") for t in trains if t.get("station")}
+        check("trains tagged with real station (KGX/STP)", stations <= {"KGX", "STP"} and bool(stations),
+              f"got stations={stations}")
+    except Exception as e:
+        check("GET /api/trains?to=LON", False, str(e))
+
+    # MCP: search_trains with to_crs=LON
+    try:
+        resp = mcp_call(base_url, "tools/call", {
+            "name": "search_trains",
+            "arguments": {"from_crs": "CBG", "to_crs": "LON"},
+        })
+        err_msg = (resp.get("error") or {}).get("message", "")
+        check("MCP search_trains(to_crs=LON) no error", "error" not in resp, err_msg)
+        content = resp.get("result", {}).get("content", [{}])[0].get("text", "{}")
+        data = json.loads(content)
+        check("MCP result has trains", len(data.get("trains", [])) > 0)
+    except Exception as e:
+        check("MCP search_trains(to_crs=LON)", False, str(e))
+
+
 def test_train_tracker_page(base_url: str) -> None:
     section("train tracker page (/t/<identity>/<date>)")
     today = str(date.today())
@@ -449,6 +481,7 @@ def main() -> None:
     test_search_route(base_url)
     test_passing_points(base_url)
     test_rest_endpoints(base_url, pause=30)
+    test_station_groups(base_url)
     test_train_tracker_page(base_url)
 
     total = _passed + _failed

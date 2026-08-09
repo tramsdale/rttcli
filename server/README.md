@@ -116,11 +116,13 @@ The GPT will now be able to search trains, look up calling points, and find conn
 ### `/api/trains`
 | Parameter | Required | Description |
 |---|---|---|
-| `from` | ✓ | Origin CRS code (e.g. `PAD`) |
-| `to` | ✓ | Destination CRS code |
+| `from` | ✓ | Origin CRS code (e.g. `PAD`), or `LON` for King's Cross + St Pancras combined |
+| `to` | ✓ | Destination CRS code, or `LON` for King's Cross + St Pancras combined |
 | `date` | | Date `YYYY-MM-DD` (default: today) |
 | `after` | | Departing after `HHMM` |
 | `arriveby` | | Arriving by `HHMM` |
+
+When `from`/`to` is a station group like `LON`, each train in the response includes a `station` field naming the real terminal (`KGX` or `STP`) it actually uses. Station groups are not supported as `/api/route` leg codes.
 
 ### `/api/service`
 | Parameter | Required | Description |
