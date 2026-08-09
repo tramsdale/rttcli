@@ -341,6 +341,48 @@ def test_rest_endpoints(base_url: str, pause: float = 15.0) -> None:
         check("missing params → 400", False, str(e))
 
 
+def test_train_tracker_page(base_url: str) -> None:
+    section("train tracker page (/t/<identity>/<date>)")
+    today = str(date.today())
+
+    try:
+        data = rest_get(base_url, "/api/trains", **{"from": "PAD", "to": "BRI"})
+        trains = data.get("trains", [])
+        if not trains:
+            check("train tracker page (no trains to test with)", False)
+            return
+        identity = trains[0]["identity"]
+        dep_date = trains[0]["departure_date"]
+    except Exception as e:
+        check("setup: fetch identity for tracker page test", False, str(e))
+        return
+
+    try:
+        r = requests.get(f"{base_url}/t/{identity}/{dep_date}",
+                         params={"from": "PAD", "to": "BRI"}, timeout=15)
+        check("GET /t/<identity>/<date> returns 200", r.status_code == 200, f"got {r.status_code}")
+        check("response is HTML", "text/html" in r.headers.get("Content-Type", ""))
+        check("page includes headcode",  trains[0]["headcode"] in r.text)
+        check("page marks boarding stop", "board" in r.text)
+        check("page marks alighting stop", "alight" in r.text)
+    except Exception as e:
+        check("GET /t/<identity>/<date>", False, str(e))
+
+    # Unknown identity → error page, not a 500
+    try:
+        r = requests.get(f"{base_url}/t/ZZZZZZ/{today}", timeout=15)
+        check("unknown identity does not 500", r.status_code != 500, f"got {r.status_code}")
+    except Exception as e:
+        check("unknown identity handling", False, str(e))
+
+    # Malformed date → 400
+    try:
+        r = requests.get(f"{base_url}/t/{identity}/not-a-date", timeout=10)
+        check("malformed date → 400", r.status_code == 400, f"got {r.status_code}")
+    except Exception as e:
+        check("malformed date handling", False, str(e))
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -407,6 +449,7 @@ def main() -> None:
     test_search_route(base_url)
     test_passing_points(base_url)
     test_rest_endpoints(base_url, pause=30)
+    test_train_tracker_page(base_url)
 
     total = _passed + _failed
     colour = "green" if _failed == 0 else "red"

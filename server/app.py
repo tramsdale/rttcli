@@ -4,15 +4,18 @@ RTT MCP + REST server — deployable to AWS Lambda via Zappa.
 MCP endpoint:  POST /mcp   (Claude / any MCP client)
 REST endpoints: GET /api/trains, /api/service, /api/route  (Custom GPT / any HTTP client)
 OpenAPI spec:  GET /openapi.json  (paste URL into Custom GPT action setup)
+HTML page:     GET /t/<identity>/<date>  (public, no-auth live train tracker — shareable link)
 
 Environment variables:
     RTT_TOKEN   — your Real Time Trains API bearer token
 """
+import html
 import json
 import os
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlencode
 
 import requests as http
 from flask import Flask, jsonify, request
@@ -420,6 +423,274 @@ def _search_route(from1: str, to1: str, from2: str, to2: str, transfer_mins: int
         "date": str(target_date),
         "connections": result_conns,
     }
+
+
+# ── Train tracker HTML page (public, no-auth, shareable link) ──────────────────
+
+_STATUS_COLORS = {
+    "cancelled":  "#dc2626",
+    "diverted":   "#9333ea",
+    "starts":     "#0891b2",
+    "terminates": "#0891b2",
+    "delayed":    "#d97706",
+    "on_time":    "#16a34a",
+    "scheduled":  "#6b7280",
+}
+
+
+def _esc(value) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def _best_time_str(timing: dict) -> str | None:
+    """HH:MM using the best available timing, independent of display formatting."""
+    t = (timing.get("realtimeActual") or timing.get("realtimeForecast") or
+         timing.get("scheduleAdvertised") or timing.get("scheduleInternal") or "")
+    return t[11:16] or None
+
+
+def _calling_point_rows(svc_data: dict, from_crs: str | None, to_crs: str | None,
+                        include_passing: bool = False) -> list[dict]:
+    svc = svc_data.get("service", svc_data)
+    rows = []
+    for loc in svc.get("locations") or []:
+        temporal = loc.get("temporalData") or {}
+        display_as = temporal.get("displayAs")
+        sct = temporal.get("scheduledCallType")
+        is_advertised = sct in ("ADVERTISED_OPEN", "ADVERTISED_SET_DOWN", "ADVERTISED_PICK_UP")
+        is_pass = display_as == "PASS"
+        if is_pass and not include_passing:
+            continue
+        if display_as is None and not is_advertised and not is_pass:
+            continue
+
+        location = loc.get("location", {})
+        codes = location.get("shortCodes") or []
+        reasons = loc.get("reasons") or []
+
+        if is_pass:
+            timing = temporal.get("pass") or {}
+            arr_disp, arr_status = "-", "scheduled"
+            dep_disp, dep_status = rtt.time_status(timing)
+            sort_time = _best_time_str(timing)
+        else:
+            arr_timing = temporal.get("arrival") or {}
+            dep_timing = temporal.get("departure") or {}
+            arr_disp, arr_status = rtt.time_status(arr_timing)
+            dep_disp, dep_status = rtt.time_status(dep_timing)
+            sort_time = _best_time_str(dep_timing) or _best_time_str(arr_timing)
+
+        plat_obj = ((loc.get("locationMetadata") or {}).get("platform") or {})
+        platform = plat_obj.get("actual") or plat_obj.get("forecast") or plat_obj.get("planned") or "-"
+
+        label, style = rtt.status_badge_info(display_as, temporal, reasons)
+        codes_upper = [c.upper() for c in codes]
+
+        rows.append({
+            "station":        location.get("description", "-"),
+            "crs":            codes[0] if codes else "-",
+            "is_pass":        is_pass,
+            "arrives":        arr_disp,
+            "arrives_status": arr_status,
+            "departs":        dep_disp,
+            "departs_status": dep_status,
+            "sort_time":      sort_time,
+            "platform":       platform,
+            "status_label":   label,
+            "status_style":   style,
+            "board":          bool(from_crs and from_crs.upper() in codes_upper),
+            "alight":         bool(to_crs and to_crs.upper() in codes_upper),
+        })
+    return rows
+
+
+def _badge_html(label: str, style: str) -> str:
+    color = _STATUS_COLORS.get(style, "#6b7280")
+    return f'<span class="badge" style="background:{color}">{_esc(label)}</span>'
+
+
+def _error_html(title: str, message: str) -> str:
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{_esc(title)}</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         max-width: 480px; margin: 80px auto; padding: 0 16px; text-align: center; color: #334155; }}
+  h1 {{ font-size: 1.2rem; }}
+</style></head>
+<body><h1>{_esc(title)}</h1><p>{_esc(message)}</p></body></html>"""
+
+
+def _train_tracker_html(identity: str, dep_date: str, from_crs: str | None, to_crs: str | None,
+                        refresh: int) -> str:
+    data = rtt.api_service(identity, dep_date, detailed=True)
+    svc = data.get("service", data)
+    meta = svc.get("scheduleMetadata") or {}
+    origins = svc.get("origin") or [{}]
+    dests = svc.get("destination") or [{}]
+
+    headcode    = meta.get("trainReportingIdentity", "-")
+    operator    = (meta.get("operator") or {}).get("name", "-") or "-"
+    origin_name = (origins[0].get("location") or {}).get("description", "-")
+    dest_name   = (dests[0].get("location") or {}).get("description", "-")
+
+    rows = _calling_point_rows(data, from_crs, to_crs)
+
+    is_today = dep_date == str(date.today())
+    now_str = datetime.now().strftime("%H:%M") if is_today else None
+    next_idx = None
+    if now_str:
+        for i, r in enumerate(rows):
+            if r["sort_time"] and r["sort_time"] >= now_str:
+                next_idx = i
+                break
+
+    target = [r for r in rows if r["alight"]] or rows[-1:]
+    overall_label, overall_style = (
+        (target[0]["status_label"], target[0]["status_style"]) if target else ("Scheduled", "scheduled")
+    )
+
+    row_html = []
+    for i, r in enumerate(rows):
+        classes = ["stop"]
+        if i == next_idx:
+            classes.append("next")
+        elif next_idx is not None and i < next_idx:
+            classes.append("passed")
+
+        marker = "📍 " if i == next_idx else ""
+        tag = ""
+        if r["board"]:
+            tag = ' <span class="tag">board</span>'
+        elif r["alight"]:
+            tag = ' <span class="tag">alight</span>'
+
+        arr_html = f'<div class="arr">arr {_esc(r["arrives"])}</div>' if r["arrives"] not in ("-", None) else ""
+
+        row_html.append(f"""
+        <div class="{' '.join(classes)}">
+          <div class="stop-time">
+            <div class="dep">{_esc(r['departs'])}</div>
+            {arr_html}
+          </div>
+          <div class="stop-main">
+            <div class="stop-name">{marker}{_esc(r['station'])}{tag}</div>
+            <div class="stop-meta">Plat {_esc(r['platform'])}</div>
+          </div>
+          <div class="stop-status">{_badge_html(r['status_label'], r['status_style'])}</div>
+        </div>""")
+
+    refresh_meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh > 0 else ""
+    updated = datetime.now().strftime("%H:%M:%S")
+
+    toggle_params = {}
+    if from_crs:
+        toggle_params["from"] = from_crs
+    if to_crs:
+        toggle_params["to"] = to_crs
+    toggle_params["refresh"] = 0 if refresh > 0 else 30
+    toggle_url = "?" + urlencode(toggle_params)
+    toggle_label = "pause auto-refresh" if refresh > 0 else "resume auto-refresh"
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{refresh_meta}
+<title>{_esc(headcode)} {_esc(origin_name)} → {_esc(dest_name)} — Train Tracker</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; padding: 16px; max-width: 560px; margin-inline: auto;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #f8fafc; color: #0f172a;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    body {{ background: #0f172a; color: #e2e8f0; }}
+    .card {{ background: #1e293b !important; border-color: #334155 !important; }}
+    .stop {{ border-color: #334155 !important; }}
+    .stop-meta {{ color: #94a3b8 !important; }}
+    .tag {{ background: #334155 !important; }}
+    .next {{ background: rgba(96,165,250,0.15) !important; }}
+  }}
+  .card {{
+    background: #fff; border: 1px solid #e2e8f0; border-radius: 12px;
+    padding: 16px; margin-bottom: 12px;
+  }}
+  h1 {{ font-size: 1.1rem; margin: 0 0 4px; }}
+  .route {{ font-size: 0.95rem; opacity: 0.8; margin-bottom: 8px; }}
+  .badge {{
+    display: inline-block; color: #fff; font-size: 0.8rem; font-weight: 600;
+    padding: 3px 10px; border-radius: 999px; white-space: nowrap;
+  }}
+  .stop {{
+    display: flex; align-items: center; gap: 12px; padding: 10px 0;
+    border-bottom: 1px solid #e2e8f0;
+  }}
+  .stop:last-child {{ border-bottom: none; }}
+  .stop-time {{ width: 64px; flex-shrink: 0; text-align: right; font-variant-numeric: tabular-nums; }}
+  .stop-time .dep {{ font-weight: 600; }}
+  .stop-time .arr {{ font-size: 0.75rem; opacity: 0.7; }}
+  .stop-main {{ flex: 1; min-width: 0; }}
+  .stop-name {{ font-weight: 500; }}
+  .stop-meta {{ font-size: 0.8rem; color: #64748b; }}
+  .stop-status {{ flex-shrink: 0; }}
+  .passed {{ opacity: 0.45; }}
+  .next {{ background: rgba(37,99,235,0.08); border-radius: 8px; margin: 0 -8px; padding: 10px 8px; }}
+  .tag {{
+    font-size: 0.7rem; font-weight: 600; text-transform: uppercase;
+    background: #e2e8f0; padding: 1px 6px; border-radius: 4px; margin-left: 6px;
+  }}
+  footer {{ font-size: 0.8rem; opacity: 0.6; text-align: center; margin-top: 16px; }}
+  footer a {{ color: inherit; }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>{_esc(headcode)} · {_esc(operator)}</h1>
+    <div class="route">{_esc(origin_name)} → {_esc(dest_name)} · {_esc(dep_date)}</div>
+    <div class="overall">{_badge_html(overall_label, overall_style)}</div>
+  </div>
+  <div class="card">
+    {''.join(row_html) if row_html else '<p>No calling points found for this service.</p>'}
+  </div>
+  <footer>
+    Updated {updated}{f' · refreshes every {refresh}s' if refresh > 0 else ' · auto-refresh off'}
+    · <a href="{_esc(toggle_url)}">{toggle_label}</a>
+  </footer>
+</body>
+</html>"""
+
+
+@app.route("/t/<identity>/<dep_date>")
+def train_tracker(identity, dep_date):
+    from_crs = (request.args.get("from") or "").strip() or None
+    to_crs   = (request.args.get("to") or "").strip() or None
+    try:
+        refresh = int(request.args.get("refresh", 30))
+    except ValueError:
+        refresh = 30
+    refresh = max(0, min(refresh, 300))
+
+    try:
+        _parse_date(dep_date)
+    except ValueError:
+        return _error_html("Invalid date", f"{dep_date!r} is not a valid date — use YYYY-MM-DD."), 400
+
+    try:
+        page = _train_tracker_html(identity, dep_date, from_crs, to_crs, refresh)
+    except SystemExit:
+        return _error_html(
+            "Train not found",
+            "Could not find this service — it may not run on that date, or the link may be incorrect.",
+        ), 404
+    except Exception as e:
+        return _error_html("Something went wrong", f"{type(e).__name__}: {e}"), 500
+
+    return page, 200, {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"}
 
 
 # ── REST endpoints ─────────────────────────────────────────────────────────────

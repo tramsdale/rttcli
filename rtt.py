@@ -24,6 +24,7 @@ from rich.text import Text
 
 CONFIG_PATH = Path.home() / ".config" / "rtt" / "config.json"
 BASE_URL = "https://data.rtt.io"
+DEFAULT_SHARE_BASE_URL = "https://rtt.tcla.me"
 
 _term_width = shutil.get_terminal_size(fallback=(120, 24)).columns
 console = Console(width=max(_term_width, 100))
@@ -52,6 +53,27 @@ def save_token(token: str) -> None:
     cfg.pop("access_token_valid_until", None)
     save_config(cfg)
     console.print(f"[green]Token saved to {CONFIG_PATH}[/green]")
+
+
+def save_share_url(url: str) -> None:
+    cfg = load_config()
+    cfg["share_base_url"] = url.rstrip("/")
+    save_config(cfg)
+    console.print(f"[green]Share base URL set to {url.rstrip('/')}[/green]")
+
+
+def build_share_url(identity: str, dep_date: str, from_crs: str | None = None,
+                    to_crs: str | None = None) -> str:
+    base = load_config().get("share_base_url", DEFAULT_SHARE_BASE_URL).rstrip("/")
+    url = f"{base}/t/{identity}/{dep_date}"
+    params = []
+    if from_crs:
+        params.append(f"from={from_crs.upper()}")
+    if to_crs:
+        params.append(f"to={to_crs.upper()}")
+    if params:
+        url += "?" + "&".join(params)
+    return url
 
 
 def save_route(name: str, leg1_from: str, leg1_to: str, leg2_from: str, leg2_to: str, transfer: int) -> None:
@@ -277,7 +299,7 @@ def api_service(identity: str, dep_date: str, detailed: bool = False) -> dict:
 
 # ── Time display logic ────────────────────────────────────────────────────────
 
-def _time_status(timing: dict) -> tuple[str, str]:
+def time_status(timing: dict) -> tuple[str, str]:
     """
     Returns (display_str, status) where status is one of:
     'cancelled', 'delayed', 'on_time', 'forecast', 'scheduled'
@@ -308,7 +330,7 @@ def _rich_time(timing: dict, role: str = "departure") -> Text:
     """Render a time cell as Rich Text with appropriate colour."""
     if not timing:
         return Text("-", style="dim")
-    display, status = _time_status(timing)
+    display, status = time_status(timing)
     styles = {
         "cancelled": "strike red",
         "delayed": "yellow",
@@ -319,34 +341,58 @@ def _rich_time(timing: dict, role: str = "departure") -> Text:
     return Text(display, style=styles.get(status, ""))
 
 
-def _status_badge(display_as: str, temporal: dict, reasons: list) -> Text:
-    dep = temporal.get("departure") or {}
-    arr = temporal.get("arrival") or {}
+def status_badge_info(display_as: str, temporal: dict, reasons: list) -> tuple[str, str]:
+    """
+    Returns (label, style_key) where style_key is one of:
+    'cancelled', 'diverted', 'starts', 'terminates', 'delayed', 'on_time', 'scheduled'.
+    Plain-data version of the status badge, shared between the Rich CLI renderer
+    and the server's HTML train-tracker page.
+    """
+    dep     = temporal.get("departure") or {}
+    arr     = temporal.get("arrival")   or {}
+    passing = temporal.get("pass")      or {}
     lateness = (
         dep.get("realtimeAdvertisedLateness")
         or dep.get("realtimeInternalLateness")
         or arr.get("realtimeAdvertisedLateness")
         or arr.get("realtimeInternalLateness")
+        or passing.get("realtimeInternalLateness")
         or 0
     )
     reason_str = reasons[0].get("shortText", "") if reasons else ""
 
     if display_as == "CANCELLED":
-        return Text("Cancelled", style="bold red")
+        return "Cancelled", "cancelled"
     if display_as == "DIVERTED":
-        return Text("Diverted", style="bold magenta")
+        return "Diverted", "diverted"
     if display_as == "STARTS":
-        return Text("Starts here", style="bold cyan")
+        return "Starts here", "starts"
     if display_as == "TERMINATES":
-        return Text("Terminates", style="bold cyan")
+        return "Terminates", "terminates"
     if lateness and lateness > 1:
         label = f"Delayed +{lateness}m"
         if reason_str:
             label += f": {reason_str[:20]}"
-        return Text(label, style="bold yellow")
-    if dep.get("realtimeActual") or arr.get("realtimeActual"):
-        return Text("On time", style="green")
-    return Text("Scheduled", style="dim")
+        return label, "delayed"
+    if dep.get("realtimeActual") or arr.get("realtimeActual") or passing.get("realtimeActual"):
+        return "On time", "on_time"
+    return "Scheduled", "scheduled"
+
+
+_BADGE_RICH_STYLES = {
+    "cancelled": "bold red",
+    "diverted": "bold magenta",
+    "starts": "bold cyan",
+    "terminates": "bold cyan",
+    "delayed": "bold yellow",
+    "on_time": "green",
+    "scheduled": "dim",
+}
+
+
+def _status_badge(display_as: str, temporal: dict, reasons: list) -> Text:
+    label, style_key = status_badge_info(display_as, temporal, reasons)
+    return Text(label, style=_BADGE_RICH_STYLES.get(style_key, ""))
 
 
 # ── Display: departures board ─────────────────────────────────────────────────
@@ -406,7 +452,7 @@ def display_departures(data: dict, from_crs: str, to_crs: str,
         platform = platform_obj.get("actual") or platform_obj.get("planned") or "-"
 
         dep_timing = temporal.get("departure") or {}
-        _, dep_status = _time_status(dep_timing)
+        _, dep_status = time_status(dep_timing)
         # Show the actual/forecast time when available (status badge handles the +Nm detail)
         dep_time = fmt_iso(
             dep_timing.get("realtimeActual") or dep_timing.get("realtimeForecast")
@@ -586,7 +632,7 @@ _DEP_STYLES: dict[str, str] = {
 
 
 def display_route(route: dict, route_name: str, time_from: str, detail: int | None = None,
-                  arriveby_dt: datetime | None = None) -> None:
+                  arriveby_dt: datetime | None = None, share: bool = False) -> None:
     legs = route["legs"]
     transfer_mins = route.get("transfer", 25)
     leg1_from, leg1_to = legs[0]
@@ -732,7 +778,7 @@ def display_route(route: dict, route_name: str, time_from: str, detail: int | No
                  code1: str, arr1_str: str, s2: dict, leg1_arr: datetime) -> None:
         """Add a greyed-out row for a leg 2 service the traveller would miss."""
         dep2 = (s2.get("temporalData") or {}).get("departure") or {}
-        dep2_str, _ = _time_status(dep2)
+        dep2_str, _ = time_status(dep2)
         code2 = s2.get("scheduleMetadata", {}).get("trainReportingIdentity", "-")
         _, margin_text = _margin_text(dep2, leg1_arr)
         tbl.add_row(
@@ -753,7 +799,7 @@ def display_route(route: dict, route_name: str, time_from: str, detail: int | No
         ms2  = conn.get("missed_s2")
 
         dep1 = (s1.get("temporalData") or {}).get("departure") or {}
-        dep1_str, dep1_status = _time_status(dep1)
+        dep1_str, dep1_status = time_status(dep1)
         code1    = s1.get("scheduleMetadata", {}).get("trainReportingIdentity", "-")
         arr1_str = conn["leg1_arr"].strftime("%H:%M")
 
@@ -764,7 +810,7 @@ def display_route(route: dict, route_name: str, time_from: str, detail: int | No
         # Normal row: actual connection (or no-connection)
         if s2:
             dep2 = (s2.get("temporalData") or {}).get("departure") or {}
-            dep2_str, dep2_status = _time_status(dep2)
+            dep2_str, dep2_status = time_status(dep2)
             code2    = s2.get("scheduleMetadata", {}).get("trainReportingIdentity", "-")
             arr2_str = conn["leg2_arr"].strftime("%H:%M") if conn.get("leg2_arr") else "-"
             badge    = _status_badge(
@@ -813,11 +859,17 @@ def display_route(route: dict, route_name: str, time_from: str, detail: int | No
         m1 = s1.get("scheduleMetadata", {})
         console.print(f"\n[dim]Leg 1 detail: {m1.get('identity')} on {m1.get('departureDate')}…[/dim]")
         display_service_detail(api_service(m1["identity"], m1["departureDate"]), board_crs=leg1_from, highlight_crs=leg1_to)
+        if share:
+            url = build_share_url(m1["identity"], m1["departureDate"], leg1_from, leg1_to)
+            console.print(f"[bold]Share leg 1 link:[/bold] [cyan]{url}[/cyan]")
 
         if s2:
             m2 = s2.get("scheduleMetadata", {})
             console.print(f"\n[dim]Leg 2 detail: {m2.get('identity')} on {m2.get('departureDate')}…[/dim]")
             display_service_detail(api_service(m2["identity"], m2["departureDate"]), board_crs=leg2_from, highlight_crs=leg2_to)
+            if share:
+                url = build_share_url(m2["identity"], m2["departureDate"], leg2_from, leg2_to)
+                console.print(f"[bold]Share leg 2 link:[/bold] [cyan]{url}[/cyan]")
         else:
             console.print("[yellow]No leg 2 service to show detail for.[/yellow]")
 
@@ -837,6 +889,8 @@ def main() -> None:
             help="Save a two-leg route alias",
         )
         grp.add_argument("--list-routes", action="store_true", help="List saved routes")
+        grp.add_argument("--share-url", metavar="URL",
+                         help=f"Base URL for --share links (default: {DEFAULT_SHARE_BASE_URL})")
         cfg_p.add_argument("--transfer", type=int, default=25, metavar="MINS",
                            help="Transfer time in minutes (default: 25)")
         a = cfg_p.parse_args(sys.argv[2:])
@@ -845,6 +899,8 @@ def main() -> None:
         elif a.add_route:
             name, f1, t1, f2, t2 = a.add_route
             save_route(name, f1, t1, f2, t2, a.transfer)
+        elif a.share_url:
+            save_share_url(a.share_url)
         else:
             list_routes()
         return
@@ -865,6 +921,7 @@ examples:
   rtt PAD BRI --friday                         next Friday's trains
   rtt PAD BRI --date 7/6/26                    specific date
   rtt PAD BRI --detail 1                       full calling points for first train
+  rtt PAD BRI --detail 1 --share               print a public tracking link for that train
   rtt BRI PAD KGX CBG                          inline two-leg route (no save needed)
   rtt BRI PAD KGX CBG --tomorrow --after 0700  inline route with date/time options
   rtt rtn                                      run saved two-leg route
@@ -894,6 +951,8 @@ examples:
     parser.add_argument("--detail", metavar="N", type=int, help="Show full calling points for train #N")
     parser.add_argument("--passing", action="store_true", help="Include passing points in detail view (requires additional detail access)")
     parser.add_argument("--debug-passing", action="store_true", help="Dump raw temporal data for PASS entries (diagnostic)")
+    parser.add_argument("--share", action="store_true",
+                        help="Print a public link to track this train's live status (requires --detail)")
 
     args = parser.parse_args()
 
@@ -966,12 +1025,13 @@ examples:
             "transfer": 25,
         }
         route_name = f"{args.from_station.upper()}→{args.to_station.upper()}+{args.via_station.upper()}→{args.final_station.upper()}"
-        display_route(inline_route, route_name, time_from, detail=args.detail, arriveby_dt=arriveby_dt)
+        display_route(inline_route, route_name, time_from, detail=args.detail, arriveby_dt=arriveby_dt,
+                      share=args.share)
         return
 
     if is_route:
         display_route(saved_routes[args.from_station], args.from_station, time_from,
-                      detail=args.detail, arriveby_dt=arriveby_dt)
+                      detail=args.detail, arriveby_dt=arriveby_dt, share=args.share)
         return
 
     data = api_search(args.from_station, args.to_station, time_from)
@@ -1032,6 +1092,11 @@ examples:
                 console.print(f"    {json.dumps(td, indent=4, default=str)[:500]}")
             return
         display_service_detail(detail, highlight_crs=args.to_station, show_passing=args.passing)
+        if args.share:
+            url = build_share_url(identity, dep_date, args.from_station, args.to_station)
+            console.print(f"\n[bold]Share link:[/bold] [cyan]{url}[/cyan]")
+    elif args.share:
+        console.print("[yellow]--share requires --detail N to select a train.[/yellow]")
 
 
 if __name__ == "__main__":

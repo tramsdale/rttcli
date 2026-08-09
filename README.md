@@ -67,12 +67,28 @@ rtt PAD BRI --friday --arriveby 1200
 | `--monday` … `--sunday` | Show trains for the next occurrence of that weekday (always next week if today matches) |
 | `--date DD/MM/YY` | Show trains for a specific date |
 | `--detail N` | Show full calling points for train #N in the list |
+| `--share` | With `--detail N`, print a public link to track that train's live status (requires the [server](server/README.md) to be deployed) |
 
 ## Output
 
 **Departure board** — scheduled and actual departure times, headcode, destination, operator, platform, and live status (on time, delayed with reason, cancelled).
 
 **Detail view** (`--detail N`) — all calling points with arrival and departure times, platforms, and delay reasons. Your boarding station is marked `↑` in green and your alighting station `↓` in cyan.
+
+## Sharing a live tracking link
+
+`rtt PAD BRI --detail 1 --share` prints a public, no-login URL that renders a live-updating page for that train — handy for sharing with someone who wants to follow the journey without the CLI:
+
+```bash
+rtt PAD BRI --detail 1 --share
+# Share link: https://rtt.tcla.me/t/C00166/2026-08-09?from=PAD&to=BRI
+```
+
+The link auto-refreshes and highlights the next stop, so anyone with it can watch the train's progress and delays in a browser. It points at the [deployed server](server/README.md); by default this is `https://rtt.tcla.me`, but you can point it elsewhere with:
+
+```bash
+rtt config --share-url https://your-deployment.example.com
+```
 
 ## Route aliases
 

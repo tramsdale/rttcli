@@ -1,6 +1,6 @@
 # RTT Server
 
-Flask app exposing the RTT CLI as an MCP server (for Claude) and a REST API (for Custom GPT), deployable to AWS Lambda via Zappa.
+Flask app exposing the RTT CLI as an MCP server (for Claude), a REST API (for Custom GPT), and a public HTML train-tracker page, deployable to AWS Lambda via Zappa.
 
 ## Endpoints
 
@@ -11,6 +11,7 @@ Flask app exposing the RTT CLI as an MCP server (for Claude) and a REST API (for
 | `GET /api/service` | Service calling points |
 | `GET /api/route` | Two-leg connection finder |
 | `GET /openapi.json` | OpenAPI spec for Custom GPT |
+| `GET /t/<identity>/<date>` | Public, no-auth HTML page tracking one train's live status — shareable link |
 
 ## Local development
 
@@ -140,3 +141,13 @@ The GPT will now be able to search trains, look up calling points, and find conn
 | `date` | | Date `YYYY-MM-DD` |
 | `after` | | After `HHMM` |
 | `arriveby` | | Arriving at final destination by `HHMM` |
+
+### `/t/<identity>/<date>`
+
+Renders a live-updating HTML page for one train — no authentication required, safe to share. `<identity>` and `<date>` come from a `searchTrains` result (or `rtt ... --detail N --share`, which prints the full URL).
+
+| Parameter | Required | Description |
+|---|---|---|
+| `from` | | Boarding station CRS (highlights stop, shown as "board") |
+| `to` | | Alighting station CRS (highlights stop, shown as "alight") |
+| `refresh` | | Auto-refresh interval in seconds, `0`–`300` (default: `30`; `0` disables) |
