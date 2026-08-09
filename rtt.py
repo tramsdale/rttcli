@@ -8,6 +8,7 @@
 # ///
 
 import argparse
+import atexit
 import json
 import shutil
 import sys
@@ -35,6 +36,46 @@ STATION_GROUPS: dict[str, list[str]] = {
 
 def resolve_station_group(code: str) -> list[str]:
     return STATION_GROUPS.get(code.upper(), [code.upper()])
+
+
+# ── API call tracking ────────────────────────────────────────────────────────
+# Every HTTP request this run makes to the RTT API, for rate-limit visibility.
+
+_api_calls: list[dict] = []
+_debug_calls = False
+
+
+def _tracked_get(url: str, **kwargs):
+    t0 = time.monotonic()
+    r = requests.get(url, **kwargs)
+    _api_calls.append({
+        "endpoint": url.removeprefix(BASE_URL) or url,
+        "params": kwargs.get("params") or {},
+        "status": r.status_code,
+        "elapsed_ms": int((time.monotonic() - t0) * 1000),
+    })
+    return r
+
+
+def _print_api_call_summary() -> None:
+    if _debug_calls and _api_calls:
+        console.print()
+        tbl = Table(box=box.SIMPLE, show_header=True, header_style="bold blue", padding=(0, 1))
+        tbl.add_column("#", style="dim", width=3, justify="right")
+        tbl.add_column("Endpoint", width=16)
+        tbl.add_column("Params", width=50)
+        tbl.add_column("Status", width=6, justify="right")
+        tbl.add_column("Time", width=6, justify="right")
+        for i, c in enumerate(_api_calls, 1):
+            params_str = "&".join(f"{k}={v}" for k, v in c["params"].items())
+            status_style = "green" if c["status"] < 300 else "red"
+            tbl.add_row(
+                str(i), c["endpoint"], params_str,
+                Text(str(c["status"]), style=status_style), f"{c['elapsed_ms']}ms",
+            )
+        console.print(tbl)
+    console.print(f"[dim]API calls: {len(_api_calls)}[/dim]")
+
 
 _term_width = shutil.get_terminal_size(fallback=(120, 24)).columns
 console = Console(width=max(_term_width, 100))
@@ -135,7 +176,7 @@ def get_access_token() -> str:
             pass
 
     # Exchange refresh token for access token
-    r = requests.get(
+    r = _tracked_get(
         f"{BASE_URL}/api/get_access_token",
         headers={"Authorization": f"Bearer {refresh}"},
         timeout=10,
@@ -284,7 +325,7 @@ def api_search(from_crs: str, to_crs: str, time_from: str, time_window: int = 24
         "timeFrom": time_from,
         "timeWindow": time_window,
     }
-    r = requests.get(f"{BASE_URL}/gb-nr/location", headers=_headers(), params=params, timeout=10)
+    r = _tracked_get(f"{BASE_URL}/gb-nr/location", headers=_headers(), params=params, timeout=10)
     if r.status_code == 204:
         return None
     if r.status_code == 401:
@@ -358,7 +399,7 @@ def api_service(identity: str, dep_date: str, detailed: bool = False) -> dict:
     params = {"identity": identity, "departureDate": dep_date}
     if detailed:
         params["detailed"] = "true"
-    r = requests.get(f"{BASE_URL}/gb-nr/service", headers=_headers(), params=params, timeout=10)
+    r = _tracked_get(f"{BASE_URL}/gb-nr/service", headers=_headers(), params=params, timeout=10)
     if not r.ok:
         console.print(f"[red]API error {r.status_code}:[/red] {r.text[:200]}")
         sys.exit(1)
@@ -965,6 +1006,8 @@ def display_route(route: dict, route_name: str, time_from: str, detail: int | No
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
 def main() -> None:
+    atexit.register(_print_api_call_summary)
+
     # Handle `rtt config …` before argparse sees positional args
     if len(sys.argv) >= 2 and sys.argv[1] == "config":
         cfg_p = argparse.ArgumentParser(prog="rtt config")
@@ -1047,8 +1090,13 @@ station groups:
     parser.add_argument("--debug-passing", action="store_true", help="Dump raw temporal data for PASS entries (diagnostic)")
     parser.add_argument("--share", action="store_true",
                         help="Print a public link to track this train's live status (requires --detail)")
+    parser.add_argument("--debug", action="store_true",
+                        help="List every RTT API call this run made (endpoint, params, status, timing)")
 
     args = parser.parse_args()
+
+    global _debug_calls
+    _debug_calls = args.debug
 
     # Detect named route: `rtt rtn` or `rtt rtn --tomorrow` etc.
     saved_routes = load_config().get("routes", {})

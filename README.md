@@ -69,6 +69,9 @@ rtt CBG LON --tuesday --arriveby 0830   # LON = KGX + STP, merged into one order
 | `--date DD/MM/YY` | Show trains for a specific date |
 | `--detail N` | Show full calling points for train #N in the list |
 | `--share` | With `--detail N`, print a public link to track that train's live status (requires the [server](server/README.md) to be deployed) |
+| `--debug` | List every RTT API call this run made (endpoint, params, status, timing) |
+
+Every run prints a one-line `API calls: N` summary at the end, so you can see at a glance how much a command costs against the RTT rate limit — `--debug` breaks that down into the individual calls.
 
 ## Output
 
