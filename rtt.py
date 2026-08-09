@@ -26,6 +26,16 @@ CONFIG_PATH = Path.home() / ".config" / "rtt" / "config.json"
 BASE_URL = "https://data.rtt.io"
 DEFAULT_SHARE_BASE_URL = "https://rtt.tcla.me"
 
+# Pseudo station codes that expand to a set of real, nearby CRS codes searched
+# together and merged into one ordered list (e.g. "London" = King's Cross + St Pancras).
+STATION_GROUPS: dict[str, list[str]] = {
+    "LON": ["KGX", "STP"],
+}
+
+
+def resolve_station_group(code: str) -> list[str]:
+    return STATION_GROUPS.get(code.upper(), [code.upper()])
+
 _term_width = shutil.get_terminal_size(fallback=(120, 24)).columns
 console = Console(width=max(_term_width, 100))
 
@@ -234,6 +244,21 @@ def resolve_arrivals(services: list, to_crs: str) -> list[datetime | None]:
     return arrivals
 
 
+def resolve_arrivals_grouped(services: list, to_crs: str) -> list[datetime | None]:
+    """Like resolve_arrivals, but uses each service's tagged group destination (_grp_to) when present."""
+    arrivals = []
+    for svc in services:
+        target = svc.get("_grp_to") or to_crs
+        arr = get_terminus_arrival(svc, target)
+        if arr is None:
+            meta = svc.get("scheduleMetadata", {})
+            identity, dep_date = meta.get("identity", ""), meta.get("departureDate", "")
+            if identity and dep_date:
+                arr = find_arrival_at(api_service(identity, dep_date), target)
+        arrivals.append(arr)
+    return arrivals
+
+
 def find_next_service_after(services: list, earliest: datetime) -> dict | None:
     """Return the first service whose scheduled departure is at or after earliest."""
     for svc in services:
@@ -269,6 +294,53 @@ def api_search(from_crs: str, to_crs: str, time_from: str, time_window: int = 24
         console.print(f"[red]API error {r.status_code}:[/red] {r.text[:200]}")
         sys.exit(1)
     return r.json()
+
+
+def api_search_grouped(from_crs: str, to_crs: str, time_from: str,
+                       time_window: int = 240) -> tuple[list[dict], dict]:
+    """
+    Search every combination when either side is a station group (e.g. LON -> KGX+STP),
+    tagging each service with the concrete CRS pair it was found under (_grp_from/_grp_to),
+    then merge into one list ordered by departure time. Ungrouped codes behave exactly
+    like a single api_search call.
+    """
+    from_group = resolve_station_group(from_crs)
+    to_group = resolve_station_group(to_crs)
+
+    merged: list[dict] = []
+    from_names: dict[str, str] = {}
+    to_names: dict[str, str] = {}
+
+    for f in from_group:
+        for t in to_group:
+            data = api_search(f, t, time_from, time_window=time_window)
+            if not data:
+                continue
+            q = data.get("query", {})
+            from_names.setdefault(f, q.get("location", {}).get("description", f))
+            to_names.setdefault(t, q.get("filterTo", {}).get("description", t))
+            for svc in data.get("services") or []:
+                svc = dict(svc)
+                svc["_grp_from"] = f if len(from_group) > 1 else None
+                svc["_grp_to"] = t if len(to_group) > 1 else None
+                merged.append(svc)
+
+    def dep_key(svc: dict) -> str:
+        dep = (svc.get("temporalData") or {}).get("departure") or {}
+        return (dep.get("realtimeActual") or dep.get("realtimeForecast") or
+                dep.get("scheduleAdvertised") or dep.get("scheduleInternal") or "")
+
+    merged.sort(key=dep_key)
+
+    meta = {
+        "from_label": " / ".join(from_names.get(c, c) for c in from_group) if len(from_group) > 1
+                      else from_names.get(from_group[0], from_group[0]),
+        "to_label":   " / ".join(to_names.get(c, c) for c in to_group) if len(to_group) > 1
+                      else to_names.get(to_group[0], to_group[0]),
+        "from_group": from_group,
+        "to_group":   to_group,
+    }
+    return merged, meta
 
 
 _svc_cache: dict = {}
@@ -399,12 +471,17 @@ def _status_badge(display_as: str, temporal: dict, reasons: list) -> Text:
 
 def display_departures(data: dict, from_crs: str, to_crs: str,
                        arrivals: list[datetime | None] | None = None,
-                       arriveby_label: str | None = None) -> list:
+                       arriveby_label: str | None = None,
+                       group_meta: dict | None = None) -> list:
     services = data.get("services") or []
     query = data.get("query", {})
-    loc_name = query.get("location", {}).get("description", from_crs.upper())
-    filter_to = query.get("filterTo", {})
-    dest_name = filter_to.get("description", to_crs.upper())
+    if group_meta:
+        loc_name = group_meta.get("from_label", from_crs.upper())
+        dest_name = group_meta.get("to_label", to_crs.upper())
+    else:
+        loc_name = query.get("location", {}).get("description", from_crs.upper())
+        filter_to = query.get("filterTo", {})
+        dest_name = filter_to.get("description", to_crs.upper())
     time_from = fmt_iso(query.get("timeFrom", ""))
 
     from_label = f"{loc_name} ({from_crs.upper()})"
@@ -423,12 +500,17 @@ def display_departures(data: dict, from_crs: str, to_crs: str,
         console.print("[yellow]No services found.[/yellow]")
         return []
 
+    # Grouped searches append e.g. "(KGX)"/"(STP)" after the relevant time, so widen those columns.
+    is_grouped = group_meta is not None
+    dep_width = 15 if is_grouped and len(group_meta.get("from_group", [])) > 1 else 8
+    arr_width = 15 if is_grouped and len(group_meta.get("to_group", [])) > 1 else 8
+
     tbl = Table(box=box.ROUNDED, show_header=True, header_style="bold blue", padding=(0, 1), expand=False)
     tbl.add_column("#", style="dim", width=3, min_width=3, justify="right", no_wrap=True)
-    tbl.add_column("Departs", width=8, min_width=5, no_wrap=True)
+    tbl.add_column("Departs", width=dep_width, min_width=5, no_wrap=True)
     tbl.add_column("Code", width=6, min_width=4, no_wrap=True)
     tbl.add_column("Destination", width=24, min_width=16)
-    tbl.add_column(f"{to_crs.upper()} arr", width=8, min_width=5, no_wrap=True)
+    tbl.add_column(f"{to_crs.upper()} arr", width=arr_width, min_width=5, no_wrap=True)
     tbl.add_column("Operator", width=20, min_width=12, no_wrap=True)
     tbl.add_column("Plat", width=4, min_width=4, no_wrap=True)
     tbl.add_column("Status", width=26, min_width=10)
@@ -458,6 +540,9 @@ def display_departures(data: dict, from_crs: str, to_crs: str,
             dep_timing.get("realtimeActual") or dep_timing.get("realtimeForecast")
             or dep_timing.get("scheduleAdvertised") or dep_timing.get("scheduleInternal")
         )
+        grp_from = svc.get("_grp_from")
+        if grp_from and dep_time:
+            dep_time = f"{dep_time} ({grp_from})"
         dep_text = Text(
             dep_time or "-",
             style=_DEP_STYLES.get(dep_status, "") if not dep_timing.get("isCancelled") else "strike red",
@@ -467,6 +552,9 @@ def display_departures(data: dict, from_crs: str, to_crs: str,
 
         arr_dt = arrivals[i - 1] if arrivals and i - 1 < len(arrivals) else None
         arr_str = arr_dt.strftime("%H:%M") if arr_dt else "-"
+        grp_to = svc.get("_grp_to")
+        if grp_to and arr_dt:
+            arr_str = f"{arr_str} ({grp_to})"
 
         tbl.add_row(str(i), dep_text, headcode, dest, arr_str, operator, platform, badge)
 
@@ -922,10 +1010,16 @@ examples:
   rtt PAD BRI --date 7/6/26                    specific date
   rtt PAD BRI --detail 1                       full calling points for first train
   rtt PAD BRI --detail 1 --share               print a public tracking link for that train
+  rtt CBG LON --tuesday --arriveby 0830        LON = KGX + STP, merged into one ordered list
   rtt BRI PAD KGX CBG                          inline two-leg route (no save needed)
   rtt BRI PAD KGX CBG --tomorrow --after 0700  inline route with date/time options
   rtt rtn                                      run saved two-leg route
   rtt rtn --tomorrow --after 0700
+
+station groups:
+  LON  King's Cross (KGX) + St Pancras (STP) — use as FROM or TO to search both
+       and merge the results, ordered by departure time. Each row is annotated
+       with the actual station, e.g. "16:01 (KGX)".
 """,
     )
 
@@ -1034,14 +1128,13 @@ examples:
                       detail=args.detail, arriveby_dt=arriveby_dt, share=args.share)
         return
 
-    data = api_search(args.from_station, args.to_station, time_from)
+    raw_services, group_meta = api_search_grouped(args.from_station, args.to_station, time_from)
 
-    if data is None:
+    if not raw_services:
         console.print("[yellow]No services found for this query.[/yellow]")
         return
 
-    raw_services = data.get("services") or []
-    arrivals = resolve_arrivals(raw_services, args.to_station)
+    arrivals = resolve_arrivals_grouped(raw_services, args.to_station)
 
     # ── Filter by arriveby ──
     arriveby_label: str | None = None
@@ -1057,10 +1150,10 @@ examples:
                 first_after = True
         raw_services = [s for s, _ in filtered]
         arrivals     = [a for _, a in filtered]
-        data = {**data, "services": raw_services}
 
+    data = {"query": {"timeFrom": time_from}, "services": raw_services}
     services = display_departures(data, args.from_station, args.to_station, arrivals,
-                                  arriveby_label=arriveby_label)
+                                  arriveby_label=arriveby_label, group_meta=group_meta)
 
     # ── Detail view ──
     if args.detail is not None:
@@ -1073,6 +1166,10 @@ examples:
         sched_meta = svc.get("scheduleMetadata", {})
         identity = sched_meta.get("identity")
         dep_date = sched_meta.get("departureDate")
+        # A grouped search (e.g. "LON") tags each service with the real station it
+        # was found under — use that for highlighting/sharing, not the pseudo code.
+        effective_from = svc.get("_grp_from") or args.from_station
+        effective_to   = svc.get("_grp_to") or args.to_station
 
         if not identity or not dep_date:
             console.print("[red]Could not determine service identity from the listing.[/red]")
@@ -1091,9 +1188,9 @@ examples:
                 console.print(f"  [bold]{name}[/bold]")
                 console.print(f"    {json.dumps(td, indent=4, default=str)[:500]}")
             return
-        display_service_detail(detail, highlight_crs=args.to_station, show_passing=args.passing)
+        display_service_detail(detail, highlight_crs=effective_to, show_passing=args.passing)
         if args.share:
-            url = build_share_url(identity, dep_date, args.from_station, args.to_station)
+            url = build_share_url(identity, dep_date, effective_from, effective_to)
             console.print(f"\n[bold]Share link:[/bold] [cyan]{url}[/cyan]")
     elif args.share:
         console.print("[yellow]--share requires --detail N to select a train.[/yellow]")

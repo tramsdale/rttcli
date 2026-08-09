@@ -9,7 +9,8 @@ import pytest
 import rtt
 from rtt import (
     _status_badge,
-    _time_status,
+    time_status,
+    api_search_grouped,
     display_departures,
     display_service_detail,
     find_arrival_at,
@@ -21,6 +22,8 @@ from rtt import (
     parse_hhmm,
     parse_iso_naive,
     resolve_arrivals,
+    resolve_arrivals_grouped,
+    resolve_station_group,
 )
 
 
@@ -121,18 +124,18 @@ class TestNextWeekday:
         assert result == today + timedelta(days=1)
 
 
-# ── _time_status ──────────────────────────────────────────────────────────────
+# ── time_status ──────────────────────────────────────────────────────────────
 
 class TestTimeStatus:
     def test_empty_dict(self):
-        assert _time_status({}) == ("-", "scheduled")
+        assert time_status({}) == ("-", "scheduled")
 
     def test_cancelled(self):
         timing = {
             "scheduleAdvertised": "2026-06-07T21:30:00",
             "isCancelled": True,
         }
-        display, status = _time_status(timing)
+        display, status = time_status(timing)
         assert status == "cancelled"
         assert display == "21:30"
 
@@ -143,7 +146,7 @@ class TestTimeStatus:
             "realtimeAdvertisedLateness": 0,
             "isCancelled": False,
         }
-        display, status = _time_status(timing)
+        display, status = time_status(timing)
         assert status == "on_time"
         assert display == "21:30"
 
@@ -154,7 +157,7 @@ class TestTimeStatus:
             "realtimeAdvertisedLateness": 5,
             "isCancelled": False,
         }
-        display, status = _time_status(timing)
+        display, status = time_status(timing)
         assert status == "delayed"
         assert display == "21:30→21:35 (+5m)"
 
@@ -164,7 +167,7 @@ class TestTimeStatus:
             "realtimeForecast": "2026-06-07T21:30:00",
             "isCancelled": False,
         }
-        display, status = _time_status(timing)
+        display, status = time_status(timing)
         assert status == "scheduled"
         assert display == "21:30"
 
@@ -175,7 +178,7 @@ class TestTimeStatus:
             "realtimeAdvertisedLateness": 10,
             "isCancelled": False,
         }
-        display, status = _time_status(timing)
+        display, status = time_status(timing)
         assert status == "delayed"
         assert display == "21:30→21:40 (+10m)"
 
@@ -184,7 +187,7 @@ class TestTimeStatus:
             "scheduleAdvertised": "2026-06-07T21:30:00",
             "isCancelled": False,
         }
-        display, status = _time_status(timing)
+        display, status = time_status(timing)
         assert status == "scheduled"
         assert display == "21:30"
 
@@ -193,7 +196,7 @@ class TestTimeStatus:
             "scheduleInternal": "2026-06-07T21:30:00",
             "isCancelled": False,
         }
-        display, status = _time_status(timing)
+        display, status = time_status(timing)
         assert display == "21:30"
 
 
@@ -408,6 +411,112 @@ class TestResolveArrivals:
         assert result[1] is None
 
 
+# ── resolve_station_group ─────────────────────────────────────────────────────
+
+class TestResolveStationGroup:
+    def test_known_alias_expands(self):
+        assert resolve_station_group("LON") == ["KGX", "STP"]
+
+    def test_lowercase_alias_expands(self):
+        assert resolve_station_group("lon") == ["KGX", "STP"]
+
+    def test_unknown_code_returns_itself(self):
+        assert resolve_station_group("PAD") == ["PAD"]
+
+    def test_unknown_code_is_uppercased(self):
+        assert resolve_station_group("pad") == ["PAD"]
+
+
+# ── resolve_arrivals_grouped ──────────────────────────────────────────────────
+
+class TestResolveArrivalsGrouped:
+    def _make_svc_with_terminus(self, dest_crs, arr_time, grp_to=None):
+        svc = {
+            "destination": [{
+                "location": {"shortCodes": [dest_crs], "longCodes": []},
+                "temporalData": {"scheduleAdvertised": arr_time},
+            }],
+            "scheduleMetadata": {"identity": "X001", "departureDate": "2026-06-07"},
+        }
+        if grp_to is not None:
+            svc["_grp_to"] = grp_to
+        return svc
+
+    def test_uses_grp_to_tag_over_passed_to_crs(self):
+        """A grouped search tags each service with the real station it matched."""
+        svc = self._make_svc_with_terminus("STP", "2026-06-07T09:05:00", grp_to="STP")
+        result = resolve_arrivals_grouped([svc], "LON")
+        assert result == [datetime(2026, 6, 7, 9, 5, 0)]
+
+    def test_falls_back_to_to_crs_when_untagged(self):
+        svc = self._make_svc_with_terminus("PAD", "2026-06-07T09:05:00")
+        result = resolve_arrivals_grouped([svc], "PAD")
+        assert result == [datetime(2026, 6, 7, 9, 5, 0)]
+
+
+# ── api_search_grouped ────────────────────────────────────────────────────────
+
+class TestApiSearchGrouped:
+    def _api_response(self, from_desc, from_crs, to_desc, to_crs, dep_times):
+        return {
+            "query": {
+                "location": {"description": from_desc},
+                "filterTo": {"description": to_desc},
+            },
+            "services": [
+                {
+                    "temporalData": {"departure": {"scheduleAdvertised": f"2026-06-07T{t}:00"}},
+                    "scheduleMetadata": {"identity": f"X{t.replace(':', '')}", "departureDate": "2026-06-07"},
+                }
+                for t in dep_times
+            ],
+        }
+
+    def test_ungrouped_behaves_like_single_search(self):
+        with patch("rtt.api_search") as mock_search:
+            mock_search.return_value = self._api_response(
+                "London Paddington", "PAD", "Bristol Temple Meads", "BRI", ["09:00"]
+            )
+            services, meta = api_search_grouped("PAD", "BRI", "2026-06-07T08:00:00")
+        mock_search.assert_called_once()
+        assert len(services) == 1
+        assert services[0]["_grp_to"] is None
+        assert services[0]["_grp_from"] is None
+        assert meta["from_label"] == "London Paddington"
+        assert meta["to_label"] == "Bristol Temple Meads"
+
+    def test_grouped_destination_merges_and_tags(self):
+        def fake_search(f, t, time_from, time_window=240):
+            if t == "KGX":
+                return self._api_response("Cambridge", "CBG", "London Kings Cross", "KGX", ["06:00", "07:00"])
+            return self._api_response("Cambridge", "CBG", "St Pancras International", "STP", ["06:30"])
+
+        with patch("rtt.api_search", side_effect=fake_search):
+            services, meta = api_search_grouped("CBG", "LON", "2026-06-07T05:00:00")
+
+        assert len(services) == 3
+        assert meta["to_group"] == ["KGX", "STP"]
+        assert "Kings Cross" in meta["to_label"] and "St Pancras" in meta["to_label"]
+        assert [s["_grp_to"] for s in services] == ["KGX", "STP", "KGX"]
+
+    def test_grouped_results_sorted_by_departure(self):
+        def fake_search(f, t, time_from, time_window=240):
+            if t == "KGX":
+                return self._api_response("Cambridge", "CBG", "London Kings Cross", "KGX", ["07:00"])
+            return self._api_response("Cambridge", "CBG", "St Pancras International", "STP", ["06:00"])
+
+        with patch("rtt.api_search", side_effect=fake_search):
+            services, _ = api_search_grouped("CBG", "LON", "2026-06-07T05:00:00")
+
+        deps = [s["temporalData"]["departure"]["scheduleAdvertised"] for s in services]
+        assert deps == sorted(deps)
+
+    def test_no_services_returns_empty_list(self):
+        with patch("rtt.api_search", return_value=None):
+            services, meta = api_search_grouped("CBG", "LON", "2026-06-07T05:00:00")
+        assert services == []
+
+
 # ── display_departures ────────────────────────────────────────────────────────
 
 class TestDisplayDepartures:
@@ -498,6 +607,87 @@ class TestDisplayDepartures:
         with patch.object(rtt.console, "print"):
             result = display_departures(data, "PAD", "BRI")
         assert len(result) == 3
+
+    def test_group_meta_uses_combined_label_in_header(self):
+        data = {"query": {}, "services": []}
+        group_meta = {
+            "from_label": "Cambridge",
+            "to_label": "London Kings Cross / St Pancras International",
+            "from_group": ["CBG"],
+            "to_group": ["KGX", "STP"],
+        }
+        printed = []
+        with patch.object(rtt.console, "print", side_effect=lambda *a, **k: printed.append(str(a))):
+            display_departures(data, "CBG", "LON", group_meta=group_meta)
+        header = next(s for s in printed if "Cambridge" in s)
+        assert "London Kings Cross / St Pancras International (LON)" in header
+
+    def test_group_meta_annotates_arrival_with_real_station(self):
+        """A grouped destination search adds e.g. '(KGX)' after each arrival time."""
+        svc = self._make_service("06:00", "London Kings Cross")
+        svc["_grp_to"] = "KGX"
+        data = {"query": {}, "services": [svc]}
+        group_meta = {
+            "from_label": "Cambridge", "to_label": "London Kings Cross / St Pancras International",
+            "from_group": ["CBG"], "to_group": ["KGX", "STP"],
+        }
+        arrivals = [datetime(2026, 6, 7, 7, 0, 0)]
+
+        rendered_rows = []
+        real_table_class = rtt.Table
+
+        class CapturingTable(real_table_class):
+            def add_row(self, *args, **kwargs):
+                rendered_rows.append([str(a) for a in args])
+                super().add_row(*args, **kwargs)
+
+        with patch.object(rtt.console, "print"), patch("rtt.Table", CapturingTable):
+            display_departures(data, "CBG", "LON", arrivals=arrivals, group_meta=group_meta)
+
+        assert rendered_rows[0][4] == "07:00 (KGX)"
+
+    def test_group_meta_annotates_departure_with_real_station(self):
+        """A grouped origin search adds e.g. '(KGX)' after each departure time."""
+        svc = self._make_service("06:00", "Bristol Temple Meads")
+        svc["_grp_from"] = "KGX"
+        data = {"query": {}, "services": [svc]}
+        group_meta = {
+            "from_label": "London Kings Cross / St Pancras International", "to_label": "Bristol Temple Meads",
+            "from_group": ["KGX", "STP"], "to_group": ["BRI"],
+        }
+
+        rendered_rows = []
+        real_table_class = rtt.Table
+
+        class CapturingTable(real_table_class):
+            def add_row(self, *args, **kwargs):
+                rendered_rows.append([str(a) for a in args])
+                super().add_row(*args, **kwargs)
+
+        with patch.object(rtt.console, "print"), patch("rtt.Table", CapturingTable):
+            display_departures(data, "LON", "BRI", group_meta=group_meta)
+
+        assert rendered_rows[0][1] == "06:00 (KGX)"
+
+    def test_no_group_meta_omits_annotation(self):
+        """Ungrouped searches render exactly as before, with no '(CRS)' suffix."""
+        svc = self._make_service("06:00", "Bristol Temple Meads")
+        data = {"query": {}, "services": [svc]}
+        arrivals = [datetime(2026, 6, 7, 7, 0, 0)]
+
+        rendered_rows = []
+        real_table_class = rtt.Table
+
+        class CapturingTable(real_table_class):
+            def add_row(self, *args, **kwargs):
+                rendered_rows.append([str(a) for a in args])
+                super().add_row(*args, **kwargs)
+
+        with patch.object(rtt.console, "print"), patch("rtt.Table", CapturingTable):
+            display_departures(data, "PAD", "BRI", arrivals=arrivals)
+
+        assert rendered_rows[0][1] == "06:00"
+        assert rendered_rows[0][4] == "07:00"
 
 
 # ── display_service_detail ────────────────────────────────────────────────────

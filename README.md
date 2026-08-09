@@ -55,6 +55,7 @@ rtt PAD BRI --date 9/6/26          # trains on a specific date (DD/MM/YY)
 rtt PAD BRI --detail 1             # full calling points for the first train
 rtt PAD BRI --after 1800 --detail 2
 rtt PAD BRI --friday --arriveby 1200
+rtt CBG LON --tuesday --arriveby 0830   # LON = KGX + STP, merged into one ordered list
 ```
 
 ### Options
@@ -74,6 +75,16 @@ rtt PAD BRI --friday --arriveby 1200
 **Departure board** — scheduled and actual departure times, headcode, destination, operator, platform, and live status (on time, delayed with reason, cancelled).
 
 **Detail view** (`--detail N`) — all calling points with arrival and departure times, platforms, and delay reasons. Your boarding station is marked `↑` in green and your alighting station `↓` in cyan.
+
+## Station groups
+
+Some station codes are aliases for a set of nearby stations, searched together and merged into one time-ordered list. Currently:
+
+| Alias | Expands to |
+|---|---|
+| `LON` | King's Cross (`KGX`) + St Pancras International (`STP`) |
+
+Use the alias as `FROM` or `TO` in place of a CRS code, e.g. `rtt CBG LON --arriveby 0830`. Each row is annotated with the real station the train actually uses, e.g. `08:03 (KGX)`. `--detail`/`--share` use that real station for highlighting and links, not the alias.
 
 ## Sharing a live tracking link
 
