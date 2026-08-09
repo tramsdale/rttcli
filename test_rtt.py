@@ -287,6 +287,39 @@ class TestGetTerminusArrival:
     def test_empty_destination_returns_none(self):
         assert get_terminus_arrival({"destination": []}, "PAD") is None
 
+    def _make_real_shape_svc(self, long_codes, arrival_time):
+        """
+        Real RTT search responses never put the CRS in destination[].location —
+        only longCodes, in RTT's internal TIPLOC-style format (no shortCodes key
+        at all). See test_matches_via_target_long_codes below for the fix this
+        shape requires.
+        """
+        return {
+            "destination": [{
+                "location": {"description": "Bristol Temple Meads", "longCodes": long_codes},
+                "temporalData": {"scheduleAdvertised": arrival_time},
+            }]
+        }
+
+    def test_real_response_shape_does_not_match_on_crs_alone(self):
+        """Reproduces the bug: matching only against the bare CRS always misses."""
+        svc = self._make_real_shape_svc(["BRSTLTM"], "2026-06-07T09:05:00")
+        assert get_terminus_arrival(svc, "BRI") is None
+
+    def test_matches_via_target_long_codes(self):
+        """The fix: pass the long codes resolved from the same search's query.filterTo."""
+        svc = self._make_real_shape_svc(["BRSTLTM"], "2026-06-07T09:05:00")
+        result = get_terminus_arrival(svc, "BRI", target_long_codes=["BRSTLTM"])
+        assert result == datetime(2026, 6, 7, 9, 5, 0)
+
+    def test_long_code_match_is_case_insensitive(self):
+        svc = self._make_real_shape_svc(["BRSTLTM"], "2026-06-07T09:05:00")
+        assert get_terminus_arrival(svc, "BRI", target_long_codes=["brstltm"]) is not None
+
+    def test_mismatched_long_codes_returns_none(self):
+        svc = self._make_real_shape_svc(["BRSTPWY"], "2026-06-07T09:05:00")
+        assert get_terminus_arrival(svc, "BRI", target_long_codes=["BRSTLTM"]) is None
+
 
 # ── find_arrival_at ───────────────────────────────────────────────────────────
 
@@ -410,6 +443,31 @@ class TestResolveArrivals:
         assert result[0] == datetime(2026, 6, 7, 9, 5, 0)
         assert result[1] is None
 
+    def _make_real_shape_svc(self, long_codes, arr_time):
+        return {
+            "destination": [{
+                "location": {"description": "Bristol Temple Meads", "longCodes": long_codes},
+                "temporalData": {"scheduleAdvertised": arr_time},
+            }],
+            "scheduleMetadata": {"identity": "X001", "departureDate": "2026-06-07"},
+        }
+
+    def test_real_shape_with_long_codes_skips_fallback_call(self):
+        """The bug fix: a genuine terminus match via long codes must not call api_service."""
+        svc = self._make_real_shape_svc(["BRSTLTM"], "2026-06-07T09:05:00")
+        with patch("rtt.api_service") as mock_api_service:
+            result = resolve_arrivals([svc], "BRI", ["BRSTLTM"])
+        mock_api_service.assert_not_called()
+        assert result == [datetime(2026, 6, 7, 9, 5, 0)]
+
+    def test_real_shape_without_long_codes_falls_back(self):
+        """Reproduces the bug: without long codes, a real terminus match is always missed."""
+        svc = self._make_real_shape_svc(["BRSTLTM"], "2026-06-07T09:05:00")
+        with patch("rtt.api_service") as mock_api_service:
+            mock_api_service.return_value = {"service": {"locations": []}}
+            resolve_arrivals([svc], "BRI")
+        mock_api_service.assert_called_once()
+
 
 # ── resolve_station_group ─────────────────────────────────────────────────────
 
@@ -453,15 +511,31 @@ class TestResolveArrivalsGrouped:
         result = resolve_arrivals_grouped([svc], "PAD")
         assert result == [datetime(2026, 6, 7, 9, 5, 0)]
 
+    def test_uses_per_station_long_codes_to_skip_fallback_call(self):
+        """LON split: KGX and STP need different long codes, looked up by the service's own tag."""
+        svc = {
+            "destination": [{
+                "location": {"description": "St Pancras International", "longCodes": ["STPX"]},
+                "temporalData": {"scheduleAdvertised": "2026-06-07T09:05:00"},
+            }],
+            "scheduleMetadata": {"identity": "X001", "departureDate": "2026-06-07"},
+            "_grp_to": "STP",
+        }
+        to_long_codes_by_crs = {"KGX": ["KNGX"], "STP": ["STPX"]}
+        with patch("rtt.api_service") as mock_api_service:
+            result = resolve_arrivals_grouped([svc], "LON", to_long_codes_by_crs)
+        mock_api_service.assert_not_called()
+        assert result == [datetime(2026, 6, 7, 9, 5, 0)]
+
 
 # ── api_search_grouped ────────────────────────────────────────────────────────
 
 class TestApiSearchGrouped:
-    def _api_response(self, from_desc, from_crs, to_desc, to_crs, dep_times):
+    def _api_response(self, from_desc, from_crs, to_desc, to_crs, dep_times, to_long_codes=None):
         return {
             "query": {
                 "location": {"description": from_desc},
-                "filterTo": {"description": to_desc},
+                "filterTo": {"description": to_desc, "longCodes": to_long_codes or []},
             },
             "services": [
                 {
@@ -498,6 +572,20 @@ class TestApiSearchGrouped:
         assert meta["to_group"] == ["KGX", "STP"]
         assert "Kings Cross" in meta["to_label"] and "St Pancras" in meta["to_label"]
         assert [s["_grp_to"] for s in services] == ["KGX", "STP", "KGX"]
+
+    def test_captures_to_long_codes_per_station(self):
+        """meta.to_long_codes lets resolve_arrivals_grouped skip the fallback call per station."""
+        def fake_search(f, t, time_from, time_window=240):
+            if t == "KGX":
+                return self._api_response("Cambridge", "CBG", "London Kings Cross", "KGX",
+                                          ["06:00"], to_long_codes=["KNGX"])
+            return self._api_response("Cambridge", "CBG", "St Pancras International", "STP",
+                                      ["06:30"], to_long_codes=["STPX"])
+
+        with patch("rtt.api_search", side_effect=fake_search):
+            _, meta = api_search_grouped("CBG", "LON", "2026-06-07T05:00:00")
+
+        assert meta["to_long_codes"] == {"KGX": ["KNGX"], "STP": ["STPX"]}
 
     def test_grouped_results_sorted_by_departure(self):
         def fake_search(f, t, time_from, time_window=240):

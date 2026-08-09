@@ -246,12 +246,21 @@ def parse_iso_naive(s: str | None) -> datetime | None:
         return None
 
 
-def get_terminus_arrival(svc: dict, target_crs: str) -> datetime | None:
-    """Return arrival time at target_crs if it appears as the service's terminus destination."""
+def get_terminus_arrival(svc: dict, target_crs: str, target_long_codes: list[str] | None = None) -> datetime | None:
+    """
+    Return arrival time at target_crs if it appears as the service's terminus destination.
+
+    svc["destination"][].location never carries shortCodes (the 3-letter CRS) — only
+    longCodes, in RTT's internal TIPLOC-style format (e.g. "BRSTLTM" for BRI). So matching
+    target_crs alone never succeeds. Pass target_long_codes — taken from the same search's
+    query.filterTo.longCodes, which uses that same format — to actually match a real
+    terminus and skip the per-service detail fetch below.
+    """
+    accept = {target_crs.upper()} | {c.upper() for c in (target_long_codes or [])}
     for dest in svc.get("destination") or []:
         loc = dest.get("location", {})
-        codes = (loc.get("shortCodes") or []) + (loc.get("longCodes") or [])
-        if target_crs.upper() in [c.upper() for c in codes]:
+        codes = {c.upper() for c in (loc.get("shortCodes") or [])} | {c.upper() for c in (loc.get("longCodes") or [])}
+        if accept & codes:
             timing = dest.get("temporalData") or {}
             t = timing.get("scheduleAdvertised") or timing.get("scheduleInternal")
             return parse_iso_naive(t)
@@ -271,11 +280,11 @@ def find_arrival_at(service_data: dict, crs: str) -> datetime | None:
     return None
 
 
-def resolve_arrivals(services: list, to_crs: str) -> list[datetime | None]:
+def resolve_arrivals(services: list, to_crs: str, to_long_codes: list[str] | None = None) -> list[datetime | None]:
     """Return the arrival time at to_crs for each service, using service detail when needed."""
     arrivals = []
     for svc in services:
-        arr = get_terminus_arrival(svc, to_crs)
+        arr = get_terminus_arrival(svc, to_crs, to_long_codes)
         if arr is None:
             meta = svc.get("scheduleMetadata", {})
             identity, dep_date = meta.get("identity", ""), meta.get("departureDate", "")
@@ -285,12 +294,14 @@ def resolve_arrivals(services: list, to_crs: str) -> list[datetime | None]:
     return arrivals
 
 
-def resolve_arrivals_grouped(services: list, to_crs: str) -> list[datetime | None]:
+def resolve_arrivals_grouped(services: list, to_crs: str,
+                             to_long_codes_by_crs: dict[str, list[str]] | None = None) -> list[datetime | None]:
     """Like resolve_arrivals, but uses each service's tagged group destination (_grp_to) when present."""
+    to_long_codes_by_crs = to_long_codes_by_crs or {}
     arrivals = []
     for svc in services:
         target = svc.get("_grp_to") or to_crs
-        arr = get_terminus_arrival(svc, target)
+        arr = get_terminus_arrival(svc, target, to_long_codes_by_crs.get(target))
         if arr is None:
             meta = svc.get("scheduleMetadata", {})
             identity, dep_date = meta.get("identity", ""), meta.get("departureDate", "")
@@ -351,6 +362,7 @@ def api_search_grouped(from_crs: str, to_crs: str, time_from: str,
     merged: list[dict] = []
     from_names: dict[str, str] = {}
     to_names: dict[str, str] = {}
+    to_long_codes: dict[str, list[str]] = {}
 
     for f in from_group:
         for t in to_group:
@@ -360,6 +372,7 @@ def api_search_grouped(from_crs: str, to_crs: str, time_from: str,
             q = data.get("query", {})
             from_names.setdefault(f, q.get("location", {}).get("description", f))
             to_names.setdefault(t, q.get("filterTo", {}).get("description", t))
+            to_long_codes.setdefault(t, q.get("filterTo", {}).get("longCodes") or [])
             for svc in data.get("services") or []:
                 svc = dict(svc)
                 svc["_grp_from"] = f if len(from_group) > 1 else None
@@ -380,6 +393,7 @@ def api_search_grouped(from_crs: str, to_crs: str, time_from: str,
                       else to_names.get(to_group[0], to_group[0]),
         "from_group": from_group,
         "to_group":   to_group,
+        "to_long_codes": to_long_codes,
     }
     return merged, meta
 
@@ -778,6 +792,7 @@ def display_route(route: dict, route_name: str, time_from: str, detail: int | No
     q1 = leg1_data.get("query", {})
     leg1_from_name = q1.get("location", {}).get("description", leg1_from)
     leg1_to_name   = q1.get("filterTo", {}).get("description", leg1_to)
+    leg1_to_long_codes = q1.get("filterTo", {}).get("longCodes") or []
 
     # ── For each leg 1 service, resolve arrival at interchange ──
     # When filtering by arriveby, fetch more trains so we have enough before the cutoff
@@ -791,7 +806,7 @@ def display_route(route: dict, route_name: str, time_from: str, detail: int | No
             continue
 
         # Try terminus shortcut first (avoids an API call when leg1_to is the train's terminus)
-        arr = get_terminus_arrival(svc, leg1_to)
+        arr = get_terminus_arrival(svc, leg1_to, leg1_to_long_codes)
         if arr is None:
             svc_detail = api_service(identity, dep_date)
             arr = find_arrival_at(svc_detail, leg1_to)
@@ -827,6 +842,7 @@ def display_route(route: dict, route_name: str, time_from: str, detail: int | No
     q2 = (leg2_data or {}).get("query", {})
     leg2_from_name = q2.get("location", {}).get("description", leg2_from)
     leg2_to_name   = q2.get("filterTo", {}).get("description", leg2_to)
+    leg2_to_long_codes = q2.get("filterTo", {}).get("longCodes") or []
 
     # For each leg 1 connection resolve:
     #   missed_s2  — first leg 2 after leg1_arr but before leg2_earliest (they'd miss it)
@@ -844,7 +860,7 @@ def display_route(route: dict, route_name: str, time_from: str, detail: int | No
         if s2 is None:
             conn["leg2_arr"] = None
             continue
-        arr2 = get_terminus_arrival(s2, leg2_to)
+        arr2 = get_terminus_arrival(s2, leg2_to, leg2_to_long_codes)
         if arr2 is None:
             s2_meta = s2.get("scheduleMetadata", {})
             detail2 = api_service(s2_meta.get("identity", ""), s2_meta.get("departureDate", ""))
@@ -1182,7 +1198,7 @@ station groups:
         console.print("[yellow]No services found for this query.[/yellow]")
         return
 
-    arrivals = resolve_arrivals_grouped(raw_services, args.to_station)
+    arrivals = resolve_arrivals_grouped(raw_services, args.to_station, group_meta.get("to_long_codes"))
 
     # ── Filter by arriveby ──
     arriveby_label: str | None = None

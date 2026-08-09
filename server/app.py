@@ -179,10 +179,11 @@ def _search_trains(from_crs: str, to_crs: str, date_str: str | None,
     query = data.get("query", {})
     from_name = query.get("location", {}).get("description", from_crs.upper())
     to_name   = query.get("filterTo", {}).get("description", to_crs.upper())
+    to_long_codes = query.get("filterTo", {}).get("longCodes") or []
     raw = data.get("services") or []
 
     try:
-        arrivals = rtt.resolve_arrivals(raw, to_crs)
+        arrivals = rtt.resolve_arrivals(raw, to_crs, to_long_codes)
     except SystemExit:
         arrivals = [None] * len(raw)
 
@@ -297,6 +298,7 @@ def _search_route(from1: str, to1: str, from2: str, to2: str, transfer_mins: int
     q1 = leg1_data.get("query", {})
     from1_name = q1.get("location", {}).get("description", from1.upper())
     to1_name   = q1.get("filterTo", {}).get("description", to1.upper())
+    to1_long_codes = q1.get("filterTo", {}).get("longCodes") or []
 
     leg1_svcs = leg1_data["services"]
     limit = len(leg1_svcs) if arriveby_dt else 5
@@ -307,7 +309,7 @@ def _search_route(from1: str, to1: str, from2: str, to2: str, transfer_mins: int
         identity, dep_date = meta.get("identity"), meta.get("departureDate")
         if not identity or not dep_date:
             continue
-        arr = rtt.get_terminus_arrival(svc, to1)
+        arr = rtt.get_terminus_arrival(svc, to1, to1_long_codes)
         if arr is None:
             try:
                 arr = rtt.find_arrival_at(rtt.api_service(identity, dep_date), to1)
@@ -335,6 +337,7 @@ def _search_route(from1: str, to1: str, from2: str, to2: str, transfer_mins: int
     q2 = (leg2_data or {}).get("query", {})
     from2_name = q2.get("location", {}).get("description", from2.upper())
     to2_name   = q2.get("filterTo", {}).get("description", to2.upper())
+    to2_long_codes = q2.get("filterTo", {}).get("longCodes") or []
 
     for conn in connections:
         # First leg-2 service after leg-1 arrives (may be too soon to catch)
@@ -347,7 +350,7 @@ def _search_route(from1: str, to1: str, from2: str, to2: str, transfer_mins: int
         if s2 is None:
             conn["leg2_arr"] = None
             continue
-        arr2 = rtt.get_terminus_arrival(s2, to2)
+        arr2 = rtt.get_terminus_arrival(s2, to2, to2_long_codes)
         if arr2 is None:
             m = s2.get("scheduleMetadata", {})
             try:
