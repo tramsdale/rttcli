@@ -524,7 +524,9 @@ def _error_html(title: str, message: str) -> str:
 
 def _train_tracker_html(identity: str, dep_date: str, from_crs: str | None, to_crs: str | None,
                         refresh: int) -> str:
-    data = rtt.api_service(identity, dep_date, detailed=True)
+    # Passing points aren't shown on this page, so no need for the (more heavily
+    # rate-limited) "additional detail" tier — same data as the plain REST lookup.
+    data = rtt.api_service(identity, dep_date, detailed=False)
     svc = data.get("service", data)
     meta = svc.get("scheduleMetadata") or {}
     origins = svc.get("origin") or [{}]
@@ -670,9 +672,11 @@ def train_tracker(identity, dep_date):
     from_crs = (request.args.get("from") or "").strip() or None
     to_crs   = (request.args.get("to") or "").strip() or None
     try:
-        refresh = int(request.args.get("refresh", 30))
+        # Off by default — auto-refresh must be turned on explicitly (?refresh=30)
+        # so an open tab doesn't keep polling the RTT API unattended.
+        refresh = int(request.args.get("refresh", 0))
     except ValueError:
-        refresh = 30
+        refresh = 0
     refresh = max(0, min(refresh, 300))
 
     try:

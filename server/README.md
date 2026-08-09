@@ -144,10 +144,10 @@ The GPT will now be able to search trains, look up calling points, and find conn
 
 ### `/t/<identity>/<date>`
 
-Renders a live-updating HTML page for one train — no authentication required, safe to share. `<identity>` and `<date>` come from a `searchTrains` result (or `rtt ... --detail N --share`, which prints the full URL).
+Renders a live-updating HTML page for one train — no authentication required, safe to share. `<identity>` and `<date>` come from a `searchTrains` result (or `rtt ... --detail N --share`, which prints the full URL). Auto-refresh is **off by default** so an open tab doesn't keep polling the RTT API unattended; pass `?refresh=30` (or tap "resume auto-refresh" on the page) to turn it on.
 
 | Parameter | Required | Description |
 |---|---|---|
 | `from` | | Boarding station CRS (highlights stop, shown as "board") |
 | `to` | | Alighting station CRS (highlights stop, shown as "alight") |
-| `refresh` | | Auto-refresh interval in seconds, `0`–`300` (default: `30`; `0` disables) |
+| `refresh` | | Auto-refresh interval in seconds, `0`–`300` (default: `0`, off) |

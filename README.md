@@ -95,7 +95,7 @@ rtt PAD BRI --detail 1 --share
 # Share link: https://rtt.tcla.me/t/C00166/2026-08-09?from=PAD&to=BRI
 ```
 
-The link auto-refreshes and highlights the next stop, so anyone with it can watch the train's progress and delays in a browser. It points at the [deployed server](server/README.md); by default this is `https://rtt.tcla.me`, but you can point it elsewhere with:
+The page highlights the next stop and shows live status. Auto-refresh is off by default (reload manually, or tap "resume auto-refresh" on the page to poll every 30s) — this keeps an open tab from repeatedly hitting the RTT API on its own. It points at the [deployed server](server/README.md); by default this is `https://rtt.tcla.me`, but you can point it elsewhere with:
 
 ```bash
 rtt config --share-url https://your-deployment.example.com
